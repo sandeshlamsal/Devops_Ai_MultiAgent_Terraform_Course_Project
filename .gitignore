@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Node
+quiz-app/backend/node_modules/
+quiz-app/frontend/node_modules/
+quiz-app/frontend/dist/
+
+# Backend env (has real credentials)
+quiz-app/backend/.env
+
+# OS
+.DS_Store
