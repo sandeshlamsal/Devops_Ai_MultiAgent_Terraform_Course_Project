@@ -5,12 +5,13 @@ Data pipeline per subtask:
   1. TEKS Reader  → official Texas standards + skill list (always available)
   2. Web Search   → DuckDuckGo results for curriculum-aligned content
   3. URL Fetcher  → reads reference_urls set by Orchestrator
-  4. Ollama       → synthesises the REAL content into structured ResearchFinding
+  4. Claude Haiku → synthesises the REAL content into structured ResearchFinding
 """
 import json
+import re
 import asyncio
 import logging
-import ollama
+import anthropic
 import config
 from models.schemas import Subtask, ResearchFinding
 from agents.tools.teks_reader  import get_full_teks_context
@@ -23,13 +24,12 @@ logger = logging.getLogger(__name__)
 
 class ResearcherAgent:
     def __init__(self):
-        self.client = ollama.AsyncClient(host=config.OLLAMA_HOST)
+        self.client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 
     async def research(self, subtask: Subtask) -> ResearchFinding:
         log("researcher", f"Researching: {subtask.title} (TEKS {subtask.teks_ref})")
 
         # ── Step 1: Fetch TEKS official standards ─────────────────────────────
-        # Determine parent topic name from subtask title/description
         topic_name = _infer_topic(subtask.title)
         difficulty  = _infer_difficulty(subtask.description)
 
@@ -74,11 +74,9 @@ class ResearcherAgent:
 === REFERENCE URL CONTENT ===
 {url_contents or 'No URL content available.'}"""
 
-        # ── Step 5: Ask Ollama to synthesise the REAL content ─────────────────
-        prompt = f"""You are a Grade 6 Texas math curriculum specialist.
-
-Below is REAL curriculum data from official Texas TEKS standards and web sources.
-Your task: synthesise this into a concise research summary for generating quiz questions.
+        # ── Step 5: Claude Haiku synthesises the REAL content ─────────────────
+        prompt = f"""Below is REAL curriculum data from official Texas TEKS standards and web sources.
+Synthesise this into a concise research summary for generating Grade 6 quiz questions.
 
 Topic: {subtask.title}
 TEKS Reference: {subtask.teks_ref}
@@ -87,7 +85,7 @@ Focus areas: {', '.join(subtask.focus_areas)}
 === REAL CURRICULUM DATA ===
 {real_context[:3000]}
 
-Based ONLY on the above real data, respond with valid JSON:
+Based ONLY on the above real data, respond with valid JSON only:
 {{
   "summary": "2-3 paragraph summary of what Grade 6 students need to know about this topic, grounded in the TEKS data above",
   "key_points": [
@@ -102,13 +100,19 @@ Based ONLY on the above real data, respond with valid JSON:
 }}"""
 
         try:
-            response = await self.client.chat(
-                model=config.OLLAMA_MODEL,
+            response = await self.client.messages.create(
+                model=config.RESEARCHER_MODEL,
+                max_tokens=1024,
+                system="You are a Grade 6 Texas math curriculum specialist. Respond ONLY with valid JSON — no other text.",
                 messages=[{"role": "user", "content": prompt}],
-                format="json",
             )
 
-            data = json.loads(response.message.content)
+            text_blocks = [b for b in response.content if b.type == "text"]
+            raw = text_blocks[0].text.strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+
+            data = json.loads(raw)
             finding = ResearchFinding(
                 subtask_id=subtask.id,
                 title=subtask.title,
@@ -121,7 +125,6 @@ Based ONLY on the above real data, respond with valid JSON:
 
         except (json.JSONDecodeError, KeyError) as exc:
             log_error(f"Researcher parse error for '{subtask.title}': {exc}")
-            # Fallback: still return a finding using TEKS baseline content
             return ResearchFinding(
                 subtask_id=subtask.id,
                 title=subtask.title,

@@ -13,9 +13,6 @@ spec:
       labels:
         app: agent-worker
     spec:
-      hostAliases:
-        - ip: "172.17.0.1"          # Docker bridge — reaches host Ollama from pod
-          hostnames: ["host.docker.internal"]
       containers:
         - name: agent-worker
           image: ghcr.io/sandeshlamsal/quiz-agent-worker:latest
