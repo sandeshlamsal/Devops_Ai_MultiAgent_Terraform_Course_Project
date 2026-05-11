@@ -164,6 +164,280 @@ All 6 agents now run entirely on the Claude API — zero local infrastructure ne
 
 ---
 
+## Agent Architecture — Technical Deep Dive
+
+This section explains exactly what makes each component an "agent", what tools
+they use, how they are wired together, and how data flows between them.
+
+---
+
+### What makes something an "agent"?
+
+A regular API call sends a prompt and gets text back. An agent is different:
+
+| Regular API call | Agent |
+|-----------------|-------|
+| One prompt, one response | Has a defined **role** and **system prompt** |
+| No memory between calls | Receives **structured input** from a previous step |
+| No tools | Can use **tools** (search, fetch, read files) |
+| Returns raw text | Returns **typed, validated output** (Pydantic schema) |
+| Runs once | Part of a **pipeline** with other agents |
+
+In this project every agent is a Python class with:
+- A dedicated `AsyncAnthropic` client
+- A `SYSTEM_PROMPT` defining its role and output format
+- An async method that takes typed input and returns typed output
+- Access to specific tools (only what it needs)
+
+---
+
+### Data Contracts — Pydantic Schemas
+
+Agents don't pass raw strings to each other. Every hand-off uses a validated
+Pydantic model defined in `models/schemas.py`:
+
+```python
+# Orchestrator → Researcher
+class Subtask(BaseModel):
+    id:             str
+    title:          str           # "One-step equations"
+    description:    str           # what to research
+    focus_areas:    list[str]     # ["solving with addition", "word problems"]
+    search_query:   str           # "Texas TEKS 6.9A Grade 6 one-step equations"
+    teks_ref:       str           # "6.9A"
+    reference_urls: list[str]     # ["https://www.khanacademy.org/..."]
+
+# Researcher → Analyst
+class ResearchFinding(BaseModel):
+    subtask_id:  str
+    title:       str
+    summary:     str              # 2-3 paragraph synthesis
+    key_points:  list[str]        # 5-7 specific skills/facts
+    confidence:  float            # 0.0–1.0
+
+# Analyst → Critic
+class AnalysisReport(BaseModel):
+    topic:             str
+    executive_summary: str
+    key_insights:      list[str]
+    detailed_findings: list[str]
+    conclusions:       str
+    recommendations:   list[str]
+
+# Critic output
+class CritiqueResult(BaseModel):
+    strengths:               list[str]
+    weaknesses:              list[str]
+    gaps:                    list[str]
+    improved_recommendations: list[str]
+    overall_score:           float     # 0.0–10.0
+```
+
+If Claude returns malformed JSON, `json.loads()` raises and the agent falls back
+gracefully — the pipeline never crashes on a bad LLM response.
+
+---
+
+### Tools Available to Each Agent
+
+Tools are plain async Python functions in `agents/tools/`. Each agent only
+imports the tools it needs — no agent has access to more than its job requires.
+
+#### Tool 1 — TEKS Reader (`agents/tools/teks_reader.py`)
+**Used by:** Researcher only
+
+The Researcher's curriculum grounding. Two layers:
+
+```
+Layer 1 — Hardcoded baseline (always available, zero network)
+  TEKS_GRADE6 dict: 5 topics × official standard codes + descriptions
+  Example:
+    '6.9A': 'Write one-variable, one-step equations and inequalities
+             to represent constraints or conditions within problems'
+  Also includes:
+    • key_skills[]   — what students must be able to do
+    • difficulty_examples{} — easy/medium/hard example questions
+
+Layer 2 — Live fetch (24-hour in-memory cache)
+  Fetches https://texreg.sos.state.tx.us (official Texas standards)
+  Falls back silently if the site is unreachable
+  Result merged into the baseline context string
+```
+
+This means the Researcher always has real, official curriculum content to
+work from — even if every web search and URL fetch fails.
+
+---
+
+#### Tool 2 — Web Search (`agents/tools/web_search.py`)
+**Used by:** Researcher only
+
+Real DuckDuckGo search — no API key, no rate limits, no cost.
+
+```python
+async def search_math_content(topic, difficulty, teks_ref) -> list[dict]:
+    # Tries 3 progressive queries, deduplicates by URL, returns ≤6 results
+    queries = [
+        f"Texas TEKS {teks_ref} Grade 6 {topic} {difficulty} math problems examples",
+        f"Grade 6 {topic} math {difficulty} problems Texas curriculum",
+        f"6th grade {topic} math worksheet examples",
+    ]
+```
+
+Each result has `title`, `href`, and `body` (snippet). The Researcher feeds
+the top 4 body snippets into the Claude Haiku prompt as real web content.
+
+---
+
+#### Tool 3 — URL Fetcher (`agents/tools/url_fetcher.py`)
+**Used by:** Researcher only
+
+Fetches up to 2 reference URLs per subtask (chosen by the Orchestrator).
+Strips HTML noise (scripts, nav, footer, ads) using BeautifulSoup, extracts
+main content, caps at 4,000 chars per URL.
+
+```python
+# Trusted portal list (set in Orchestrator system prompt):
+Khan Academy  → https://www.khanacademy.org/math/cc-sixth-grade-math
+IXL           → https://www.ixl.com/math/grade-6
+Math is Fun   → https://www.mathsisfun.com
+LearnZillion  → https://learnzillion.com/resources/74161
+EngageNY      → https://www.engageny.org/mathematics
+CK-12         → https://www.ck12.org/student/
+OpenStax      → https://openstax.org/subjects/math
+```
+
+Runs concurrently with `asyncio.Semaphore(3)`. If a URL returns 403/404,
+the fetch is silently skipped — the pipeline continues with whatever content
+was successfully retrieved.
+
+---
+
+### Concurrency Model — How Researchers Run in Parallel
+
+The pipeline uses Python's `asyncio` throughout. The Orchestrator returns
+a list of subtasks, and the pipeline launches all researchers simultaneously:
+
+```python
+# pipeline.py — the key concurrency code
+semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_RESEARCHERS)  # default: 3
+
+async def bounded_research(subtask):
+    async with semaphore:                  # max 3 running at once
+        return await researcher.research(subtask)
+
+# Launch all researchers simultaneously — asyncio handles the scheduling
+findings = await asyncio.gather(
+    *[bounded_research(t) for t in subtasks]
+)
+```
+
+```
+Timeline with 4 subtasks, Semaphore(3):
+
+t=0s   [Researcher 1] ──────────────── complete at t=12s
+t=0s   [Researcher 2] ────────── complete at t=9s
+t=0s   [Researcher 3] ──────────────────── complete at t=14s
+t=9s   [Researcher 4] ────── complete at t=16s   ← started when slot freed
+
+Total wall time: ~16s   (not 4 × 12s = 48s sequential)
+```
+
+Each researcher independently: searches DuckDuckGo → fetches URLs →
+calls Claude Haiku → returns a typed `ResearchFinding`.
+
+---
+
+### How Claude Is Called in Each Agent
+
+Every agent follows the same pattern — clean, no magic:
+
+```python
+# 1. Client initialised once per agent instance
+self.client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+
+# 2. API call — system prompt defines role, user message is the task
+response = await self.client.messages.create(
+    model=config.RESEARCHER_MODEL,          # e.g. claude-haiku-4-5-20251001
+    max_tokens=1024,
+    system=SYSTEM_PROMPT,                   # role + output format instruction
+    messages=[{"role": "user", "content": prompt}],
+)
+
+# 3. Extract text, strip markdown code fences Claude sometimes adds
+text_blocks = [b for b in response.content if b.type == "text"]
+raw = text_blocks[0].text.strip()
+raw = re.sub(r"^```(?:json)?\s*", "", raw)
+raw = re.sub(r"\s*```$", "", raw)
+
+# 4. Parse into typed Pydantic model — validation happens here
+data = json.loads(raw)
+```
+
+Every agent's system prompt ends with **"Respond ONLY with valid JSON — no other text"**
+to ensure structured, parseable output.
+
+---
+
+### How the Web App Connects to the Agents — Kafka Bridge
+
+The web app (Node.js) and agent pipeline (Python) are completely decoupled.
+They communicate only through Kafka topics:
+
+```
+Node.js Backend                         Python Agent Worker
+──────────────                          ────────────────────
+POST /api/admin/generate-questions
+  │
+  ├─ Redis: status = pending
+  └─ kafka.publish(GENERATE_QUESTIONS) ──────────────────────▶ KafkaConsumer
+                                                                      │
+                                                             asyncio.run(pipeline)
+                                                                      │
+                                                              [all 6 agents run]
+                                                                      │
+                                         KafkaProducer ◀──── publish(QUESTIONS_READY)
+                                               │
+Node.js KafkaConsumer ◀────────────────────────┘
+  │
+  ├─ INSERT INTO questions (Postgres)
+  ├─ Redis: status = done, count = N
+  └─ Admin frontend polling every 3s sees: ✅ 5 new questions generated!
+```
+
+The agent worker (`agents/worker.py`) runs **two consumer threads** permanently:
+- Thread 1: `quiz.generate-questions` → full 6-agent pipeline
+- Thread 2: `quiz.quiz-completed` → Study Plan Generator
+
+This means the web app never blocks waiting for an AI response — the admin
+gets an instant HTTP 200, and the questions appear asynchronously.
+
+---
+
+### Agent Configuration Summary
+
+```
+agents/
+├── orchestrator.py          claude-sonnet-4-6    max_tokens=4096
+├── researcher.py            claude-haiku-4-5-*   max_tokens=1024  ← cost-optimised
+├── analyst.py               claude-sonnet-4-6    max_tokens=4096
+├── critic.py                claude-sonnet-4-6    max_tokens=4096
+├── question_generator_agent.py  claude-sonnet-4-6  max_tokens=4096
+├── worker.py                Kafka consumer entry point (2 threads)
+└── tools/
+    ├── teks_reader.py       Texas TEKS standards (hardcoded + live cache)
+    ├── web_search.py        DuckDuckGo (no API key, no cost)
+    └── url_fetcher.py       HTML scraper (httpx + BeautifulSoup)
+
+models/
+└── schemas.py               Pydantic v2 data contracts between agents
+
+config.py                    All model names as env vars (overridable)
+pipeline.py                  asyncio orchestration (gather + semaphore)
+```
+
+---
+
 ## How the Agents Work Together
 
 Six specialised AI agents collaborate in a structured pipeline to power the quiz app.
@@ -328,6 +602,114 @@ Student submits final answer
 Saved to student_study_plans table
 Student Dashboard shows "🤖 AI Study Plan" within ~15 seconds
 ```
+
+---
+
+### Tools & Technologies Used Per Agent
+
+| Agent | Model | Tools Used | Libraries |
+|-------|-------|-----------|-----------|
+| Orchestrator | `claude-sonnet-4-6` | None (pure reasoning) | `anthropic`, `pydantic` |
+| Researcher | `claude-haiku-4-5-20251001` | TEKS Reader, DuckDuckGo Search, URL Fetcher | `anthropic`, `ddgs`, `httpx`, `beautifulsoup4`, `pydantic` |
+| Analyst | `claude-sonnet-4-6` | None (synthesis of findings) | `anthropic`, `pydantic` |
+| Critic | `claude-sonnet-4-6` | None (independent review) | `anthropic`, `pydantic` |
+| Question Generator | `claude-sonnet-4-6` | None (structured writing) | `anthropic`, `pydantic` |
+| Study Plan Generator | `claude-haiku-4-5-20251001` | None (personalised writing) | `anthropic` |
+
+**Infrastructure binding the agents together:**
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| Async concurrency | Python `asyncio` + `asyncio.gather` | Run researchers in parallel |
+| Rate control | `asyncio.Semaphore(3)` | Limit max concurrent Claude calls |
+| Data contracts | `pydantic v2` BaseModel | Typed, validated hand-offs between agents |
+| Web search | `ddgs` (DuckDuckGo) | Real curriculum content, no API key |
+| HTML scraping | `httpx` + `beautifulsoup4` | Extract clean text from reference URLs |
+| Message bus | Apache Kafka (KRaft) | Decouples web app from agent pipeline |
+| Session cache | Redis (AOF persistent) | Active quiz state + generation status |
+| Persistent storage | PostgreSQL + PVC | All questions, users, scores, plans |
+
+---
+
+### Agentic Flow vs Classic Non-Agentic Flow
+
+This shows exactly why the multi-agent approach produces better quiz questions than
+a single API call would — and why other teams can apply this pattern to their own projects.
+
+#### The classic (non-agentic) approach:
+
+```python
+# Everything in one prompt — no tools, no web data, no validation
+response = claude.messages.create(
+    model="claude-sonnet-4-6",
+    messages=[{
+        "role": "user",
+        "content": "Write 5 Grade 6 algebra quiz questions at medium difficulty."
+    }]
+)
+# Result: generic questions, no TEKS alignment, no real curriculum grounding,
+#         may repeat question types, no quality review
+```
+
+**Problems:**
+- Claude only knows what it was trained on — no live curriculum data
+- One model does everything — planning, research, writing, quality control
+- No check on output quality — bad questions go straight to students
+- Blocking — the web app hangs for the full generation time
+- Not scalable — one big prompt vs. parallel specialised work
+
+---
+
+#### The agentic approach (this project):
+
+```
+Orchestrator plans → Researchers gather REAL data in parallel
+→ Analyst synthesises → Critic quality-checks → Writer produces final questions
+```
+
+**Advantages:**
+
+| Problem (classic) | Solution (agentic) | Benefit |
+|------------------|--------------------|---------|
+| Generic questions | Researcher fetches real TEKS standards + web content | Questions grounded in official Texas curriculum |
+| One model does everything | Specialised agents per task | Each agent optimised for its specific job |
+| No quality control | Critic independently reviews Analyst output | Gaps caught before questions are written |
+| Blocking web app | Kafka decouples generation from HTTP response | Admin gets instant response, agents run async |
+| Sequential = slow | `asyncio.gather` runs researchers in parallel | 4 subtopics researched simultaneously |
+| No cost control | Haiku for high-volume tasks, Sonnet only where needed | ~60% cost reduction vs all-Sonnet |
+| All-or-nothing failure | Each agent has fallback | Pipeline completes even if URLs return 404 |
+| Opaque process | Each agent logs its step | Full observability of what each agent did |
+
+---
+
+### Reusing This Pattern on Other Projects
+
+The multi-agent structure is not specific to math quizzes. Any team can apply
+the same pattern to a different domain by swapping the content:
+
+```
+Your domain → Replace:
+  TEKS standards reader  →  your domain knowledge base (docs, specs, policies)
+  DuckDuckGo web search  →  your internal search / Confluence / Notion API
+  Reference URL fetcher  →  your internal documentation URLs
+  Question Generator     →  your output writer (report, email, code, summary)
+  Study Plan Generator   →  your personalisation agent (recommendation, alert)
+```
+
+**The reusable template:**
+
+```
+1. ORCHESTRATOR  — breaks the problem into N focused subtasks
+2. RESEARCHERS   — gather real data per subtask (parallel, tool-equipped)
+3. ANALYST       — synthesises findings into a coherent report
+4. CRITIC        — independently reviews for gaps and quality
+5. WRITER        — produces the final structured output
+6. MESSAGE BUS   — decouples trigger from execution (Kafka / SQS / Pub/Sub)
+```
+
+This pattern works for: **legal document analysis, code review pipelines,
+competitive intelligence, content generation, customer support triage,
+medical literature synthesis, financial report generation**, and more.
 
 ---
 
