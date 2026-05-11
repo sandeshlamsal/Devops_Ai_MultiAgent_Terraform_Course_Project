@@ -21,7 +21,15 @@ For EACH subtask you MUST provide:
 1. search_query — a specific DuckDuckGo search string that will return real Grade 6
    Texas math content, worked examples, and practice problems
 2. teks_ref — the exact Texas TEKS standard code this subtask covers (e.g. 6.7A, 6.9B)
-3. reference_urls — 1-2 specific educational URLs likely to have quality content
+3. reference_urls — 1-2 URLs chosen from these trusted Grade 6 math portals:
+   Khan Academy  : https://www.khanacademy.org/math/cc-sixth-grade-math
+   IXL           : https://www.ixl.com/math/grade-6
+   Math is Fun   : https://www.mathsisfun.com
+   LearnZillion  : https://learnzillion.com/resources/74161
+   EngageNY      : https://www.engageny.org/mathematics
+   CK-12         : https://www.ck12.org/student/
+   OpenStax      : https://openstax.org/subjects/math
+   Pick the 1-2 most relevant to the subtask topic.
 
 Respond ONLY with valid JSON — no other text:
 {
