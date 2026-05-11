@@ -1,4 +1,5 @@
 import json
+import re
 import anthropic
 import config
 from models.schemas import AnalysisReport, CritiqueResult
@@ -49,7 +50,11 @@ Recommendations:
             messages=[{"role": "user", "content": prompt}],
         )
 
-        data = json.loads(response.content[0].text)
+        text_blocks = [b for b in response.content if b.type == "text"]
+        raw = text_blocks[0].text.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
         result = CritiqueResult(
             strengths=data["strengths"],
             weaknesses=data["weaknesses"],
