@@ -15,3 +15,6 @@ quiz-app/backend/.env
 
 # OS
 .DS_Store
+k8s/secret.yaml
+terraform/.terraform/
+terraform/terraform.tfstate*

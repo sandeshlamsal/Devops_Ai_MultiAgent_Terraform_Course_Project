@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-worker
+  namespace: mathquiz
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-worker
+  template:
+    metadata:
+      labels:
+        app: agent-worker
+    spec:
+      hostAliases:
+        - ip: "172.17.0.1"          # Docker bridge — reaches host Ollama from pod
+          hostnames: ["host.docker.internal"]
+      containers:
+        - name: agent-worker
+          image: ghcr.io/sandeshlamsal/quiz-agent-worker:latest
+          envFrom:
+            - configMapRef:
+                name: mathquiz-config
+          env:
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mathquiz-secrets
+                  key: ANTHROPIC_API_KEY

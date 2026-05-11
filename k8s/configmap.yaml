@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mathquiz-config
+  namespace: mathquiz
+data:
+  DATABASE_URL:            "postgresql://postgres:postgres@postgres:5432/mathquiz"
+  REDIS_URL:               "redis://redis:6379"
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+  FRONTEND_URL:            "http://localhost:30080"
+  PORT:                    "3001"
+  OLLAMA_HOST:             "http://host.docker.internal:11434"
+  OLLAMA_MODEL:            "gpt-oss:20b"
+  ORCHESTRATOR_MODEL:      "claude-sonnet-4-6"
+  ANALYST_MODEL:           "claude-sonnet-4-6"
+  CRITIC_MODEL:            "claude-sonnet-4-6"
+  QUESTION_GENERATOR_MODEL: "claude-sonnet-4-6"

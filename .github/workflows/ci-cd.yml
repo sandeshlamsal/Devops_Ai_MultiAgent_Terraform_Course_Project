@@ -1,0 +1,133 @@
+name: CI/CD — Build, Push & Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  # ── 1. Build & push all images (OIDC via GITHUB_TOKEN — no secrets needed) ──
+  build-and-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # OIDC scope that lets GITHUB_TOKEN push to GHCR
+
+    outputs:
+      image_tag: ${{ steps.tag.outputs.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR (OIDC — GITHUB_TOKEN)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - id: tag
+        run: echo "sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Build & push quiz-postgres
+        uses: docker/build-push-action@v5
+        with:
+          context: ./quiz-app/postgres
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/quiz-postgres:latest
+            ${{ env.IMAGE_PREFIX }}/quiz-postgres:${{ steps.tag.outputs.sha }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Build & push quiz-backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./quiz-app/backend
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/quiz-backend:latest
+            ${{ env.IMAGE_PREFIX }}/quiz-backend:${{ steps.tag.outputs.sha }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Build & push quiz-frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./quiz-app/frontend
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/quiz-frontend:latest
+            ${{ env.IMAGE_PREFIX }}/quiz-frontend:${{ steps.tag.outputs.sha }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Build & push quiz-agent-worker
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./agents/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/quiz-agent-worker:latest
+            ${{ env.IMAGE_PREFIX }}/quiz-agent-worker:${{ steps.tag.outputs.sha }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+  # ── 2. Deploy to local K8s cluster ─────────────────────────────────────────
+  deploy:
+    name: Deploy to Kubernetes
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: ${{ vars.DEPLOY_ENABLED == 'true' }}
+
+    env:
+      IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+      NS: mathquiz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl (deploy ServiceAccount kubeconfig)
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Apply base manifests
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/configmap.yaml
+          kubectl apply -f k8s/postgres/
+          kubectl apply -f k8s/redis/
+          kubectl apply -f k8s/kafka/
+          kubectl apply -f k8s/backend/
+          kubectl apply -f k8s/frontend/
+          kubectl apply -f k8s/agent-worker/
+
+      - name: Roll out new images
+        run: |
+          P=${{ env.IMAGE_PREFIX }}
+          T=${{ env.IMAGE_TAG }}
+          N=${{ env.NS }}
+          kubectl set image deployment/backend      backend=${P}/quiz-backend:${T}           -n $N
+          kubectl set image deployment/frontend     frontend=${P}/quiz-frontend:${T}         -n $N
+          kubectl set image deployment/agent-worker agent-worker=${P}/quiz-agent-worker:${T} -n $N
+
+      - name: Wait for rollouts
+        run: |
+          N=${{ env.NS }}
+          kubectl rollout status deployment/backend      -n $N --timeout=120s
+          kubectl rollout status deployment/frontend     -n $N --timeout=120s
+          kubectl rollout status deployment/agent-worker -n $N --timeout=120s
+
+      - name: Show running pods
+        run: kubectl get pods,svc -n ${{ env.NS }}
