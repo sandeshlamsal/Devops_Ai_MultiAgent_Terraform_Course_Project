@@ -22,11 +22,12 @@ worker service.
 8. [Docker & Containerisation](#docker--containerisation)
 9. [GHCR Image Registry](#ghcr-image-registry)
 10. [GitHub Actions CI/CD](#github-actions-cicd)
-11. [Deployment — Docker Desktop](#deployment--docker-desktop)
-12. [Environment Variables](#environment-variables)
-13. [Project Structure](#project-structure)
-14. [Local Development (without Docker)](#local-development-without-docker)
-15. [Default Credentials](#default-credentials)
+11. [Kubernetes Deployment — New Cluster Setup](#kubernetes-deployment--new-cluster-setup)
+12. [Deployment — Docker Desktop (Compose)](#deployment--docker-desktop)
+13. [Environment Variables](#environment-variables)
+14. [Project Structure](#project-structure)
+15. [Local Development (without Docker)](#local-development-without-docker)
+16. [Default Credentials](#default-credentials)
 
 ---
 
@@ -914,6 +915,242 @@ Push to main
 **Monitor runs:**
 ```
 https://github.com/sandeshlamsal/Devops_Ai_MultiAgent_Terraform_Course_Project/actions
+```
+
+---
+
+## Kubernetes Deployment — New Cluster Setup
+
+Deploy the full stack to **any Kubernetes cluster** (Docker Desktop, kind, k3s, EKS, GKE, AKS)
+using the provided manifests and Terraform-managed deploy role.
+
+```
+Repo → GitHub Actions → GHCR (images) → kubectl → K8s cluster
+         (OIDC/GITHUB_TOKEN)              (KUBE_CONFIG secret)
+```
+
+### Prerequisites
+
+| Tool | Version | Install |
+|------|---------|---------|
+| kubectl | 1.28+ | [kubernetes.io/docs/tasks/tools](https://kubernetes.io/docs/tasks/tools/) |
+| Terraform | 1.6+ | [developer.hashicorp.com/terraform/install](https://developer.hashicorp.com/terraform/install) |
+| A running K8s cluster | any | Docker Desktop K8s / kind / k3s / EKS |
+| Ollama | latest | `brew install ollama` (runs on host, not in cluster) |
+
+---
+
+### Step 1 — Enable Kubernetes on your cluster
+
+**Docker Desktop (easiest for local):**
+1. Docker Desktop → Settings → Kubernetes → ✅ Enable Kubernetes → Apply & Restart
+2. Verify: `kubectl config use-context docker-desktop && kubectl get nodes`
+
+**kind (alternative local cluster):**
+```sh
+brew install kind
+kind create cluster --name mathquiz
+kubectl config use-context kind-mathquiz
+```
+
+**k3s (Linux VM / server):**
+```sh
+curl -sfL https://get.k3s.io | sh -
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+```
+
+---
+
+### Step 2 — Create the deploy role with Terraform
+
+Terraform provisions the `mathquiz` namespace, a scoped `github-actions-deployer`
+ServiceAccount, and a minimal Role (no cluster-admin).
+
+```sh
+cd terraform
+
+# Initialise providers
+terraform init
+
+# Preview what will be created
+terraform plan
+
+# Apply — creates namespace + ServiceAccount + Role + RoleBinding + token secret
+terraform apply
+```
+
+Expected output:
+```
+kubernetes_namespace.mathquiz: Creating...
+kubernetes_service_account.github_deployer: Creating...
+kubernetes_role.deployer: Creating...
+kubernetes_role_binding.deployer: Creating...
+kubernetes_secret.deployer_token: Creating...
+
+Apply complete! Resources: 5 added.
+
+Outputs:
+  deployer_service_account = "github-actions-deployer"
+  get_kubeconfig_command   = <<...steps to generate KUBE_CONFIG...>>
+```
+
+> **Context tip:** If your context isn't `docker-desktop`, pass it:
+> `terraform apply -var="kube_context=kind-mathquiz"`
+
+---
+
+### Step 3 — Create the app secrets in the cluster
+
+```sh
+# Copy the example and fill in real values
+cp k8s/secret.yaml.example k8s/secret.yaml
+# Edit k8s/secret.yaml:
+#   JWT_SECRET        → openssl rand -base64 32
+#   ANTHROPIC_API_KEY → your Anthropic key
+#   POSTGRES_PASSWORD → postgres (or change it)
+
+kubectl apply -f k8s/secret.yaml
+```
+
+---
+
+### Step 4 — Generate the KUBE_CONFIG for GitHub Actions
+
+The Terraform output prints the exact command. Run it to get a base64-encoded kubeconfig
+scoped only to the `mathquiz` namespace and the deploy ServiceAccount:
+
+```sh
+# Get token
+TOKEN=$(kubectl get secret github-deployer-token -n mathquiz \
+  -o jsonpath='{.data.token}' | base64 -d)
+
+# Get cluster server + CA
+SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+CA=$(kubectl get secret github-deployer-token -n mathquiz \
+  -o jsonpath='{.data.ca\.crt}')
+
+# Build and base64-encode a minimal kubeconfig
+cat <<EOF | base64 | tr -d '\n'
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority-data: $CA
+    server: $SERVER
+  name: mathquiz-cluster
+contexts:
+- context:
+    cluster: mathquiz-cluster
+    namespace: mathquiz
+    user: github-actions-deployer
+  name: mathquiz
+current-context: mathquiz
+users:
+- name: github-actions-deployer
+  user:
+    token: $TOKEN
+EOF
+```
+
+Copy the output (a long base64 string) — you'll paste it into GitHub next.
+
+---
+
+### Step 5 — Configure GitHub repository settings
+
+Go to **GitHub → your repo → Settings → Secrets and variables → Actions**:
+
+| Type | Name | Value |
+|------|------|-------|
+| Secret | `KUBE_CONFIG` | base64 kubeconfig from Step 4 |
+| Variable | `DEPLOY_ENABLED` | `true` |
+
+The pipeline uses `GITHUB_TOKEN` (automatic OIDC) to push images — **no AWS keys needed**.
+
+---
+
+### Step 6 — First deployment
+
+```sh
+# Option A: push to main to trigger the pipeline automatically
+git push origin main
+
+# Option B: trigger manually from GitHub UI
+# Actions → CI/CD — Build, Push & Deploy → Run workflow
+```
+
+The pipeline will:
+1. Build all 4 images and push to GHCR (tagged `latest` + 7-char SHA)
+2. Apply all K8s manifests (`k8s/`)
+3. Roll out new images to backend, frontend, agent-worker
+4. Wait for rollouts to complete
+5. Print running pods and services
+
+---
+
+### Step 7 — Verify the deployment
+
+```sh
+# All pods should be Running
+kubectl get pods -n mathquiz
+
+# Expected output:
+# NAME                            READY   STATUS    RESTARTS
+# postgres-0                      1/1     Running   0
+# redis-xxx                       1/1     Running   0
+# kafka-0                         1/1     Running   0
+# backend-xxx                     1/1     Running   0
+# frontend-xxx                    1/1     Running   0
+# agent-worker-xxx                1/1     Running   0
+
+# Open the app (NodePort)
+open http://localhost:30080
+
+# Check backend health
+curl http://localhost:30080/api/topics
+
+# Tail agent-worker logs
+kubectl logs -f deployment/agent-worker -n mathquiz
+
+# Tail backend logs
+kubectl logs -f deployment/backend -n mathquiz
+```
+
+---
+
+### Cluster compatibility matrix
+
+| Cluster | Works | Notes |
+|---------|-------|-------|
+| Docker Desktop K8s | ✅ | Default context `docker-desktop`. NodePort `:30080` → `localhost:30080` |
+| kind | ✅ | Use `kind-mathquiz` context. May need `kubectl port-forward` instead of NodePort |
+| k3s | ✅ | Use `/etc/rancher/k3s/k3s.yaml` as kubeconfig |
+| EKS | ✅ | Replace `KUBE_CONFIG` with EKS kubeconfig. Consider AWS Load Balancer for frontend |
+| GKE | ✅ | Use GKE kubeconfig. Add `LoadBalancer` type to frontend service |
+| AKS | ✅ | Use AKS kubeconfig. Same as GKE |
+
+---
+
+### Useful kubectl commands
+
+```sh
+# Watch all pods live
+kubectl get pods -n mathquiz -w
+
+# Restart a deployment (picks up latest image)
+kubectl rollout restart deployment/backend -n mathquiz
+
+# Scale agent-worker (run more Kafka consumers)
+kubectl scale deployment/agent-worker --replicas=2 -n mathquiz
+
+# Port-forward backend directly (bypass NodePort)
+kubectl port-forward deployment/backend 3001:3001 -n mathquiz
+
+# Delete everything (keeps PVC — data safe)
+kubectl delete -f k8s/ --recursive
+
+# Full wipe including data
+kubectl delete namespace mathquiz
 ```
 
 ---
