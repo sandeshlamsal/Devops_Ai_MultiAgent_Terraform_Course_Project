@@ -1,7 +1,9 @@
 # Math Quiz — Multi-Agent AI + Kafka + DevOps Project
 
 A **Texas Grade 6 TEKS-aligned** math practice quiz application where **Apache Kafka**
-drives genuine real-time **multi-agent AI pipelines** at runtime (Claude + Ollama).
+drives genuine real-time **multi-agent AI pipelines** at runtime — powered entirely by
+**Claude (Anthropic)** for planning, analysis, critique, and question generation, with
+**Ollama** handling only the concurrent web-research step (free, private, on-device).
 Admins trigger AI question generation; students receive personalised study plans after
 every quiz — all processed asynchronously via Kafka topics and a dedicated Python agent
 worker service.
@@ -138,25 +140,37 @@ python main.py "Texas Grade 6 math quiz platform"
 
 ### Mode 2 — Runtime Agents (live, Kafka-driven)
 
-Agents run **inside the deployed application** whenever triggered via Kafka:
+Agents run **inside the deployed application** whenever triggered via Kafka.
+Four of the five agents call the **Claude API in real time**; only the Researcher
+uses Ollama (local, free, parallel web research).
 
-#### Agent 1: Orchestrator (Claude Sonnet)
+#### Agent 1: Orchestrator — `claude-sonnet-4-6`
 - **Trigger**: Admin clicks "🤖 Generate with AI"
-- **Tool use**: `plan_research` forced tool call — returns structured subtask list
-- **Output**: 2–5 focused research subtasks for parallel execution
+- Breaks the topic into 2–5 focused research subtasks with TEKS references and search queries
+- Responds with structured JSON; markdown code-fences are stripped before parsing
+- **Output**: list of `Subtask` objects → handed to Researcher pool
 
-#### Agent 2: Researcher × N (Ollama gpt-oss:20b — local, free)
+#### Agent 2: Researcher × N — Ollama `gpt-oss:20b` (local)
 - **Runs concurrently** using `asyncio.gather` + `asyncio.Semaphore(3)`
-- Each instance researches one subtask independently
-- **Output**: `ResearchFinding` (summary, key points, confidence score)
+- Each instance runs a DuckDuckGo search, fetches reference URLs, and synthesises findings
+- **Output**: `ResearchFinding` (title, summary, key points, confidence score)
 
-#### Agent 3: Question Generator (Claude Sonnet + prompt caching)
-- Receives all research findings
-- Formats them into quiz questions (question, 4 options, correct answer, explanation)
-- System prompt cached via `cache_control: ephemeral` — reduces cost on repeated runs
-- **Output**: JSON array of quiz questions → saved to Postgres
+#### Agent 3: Analyst — `claude-sonnet-4-6`
+- Receives all `ResearchFinding` objects from the Researcher pool
+- Synthesises them into a structured analysis report (executive summary, insights, conclusions)
+- **Output**: `AnalysisReport` → passed to Critic
 
-#### Agent 4: Study Plan Generator (Claude Haiku — cost-optimised)
+#### Agent 4: Critic — `claude-sonnet-4-6`
+- Reviews the Analyst's report for logical consistency, completeness, and actionability
+- Scores the report out of 10 and surfaces gaps and improved recommendations
+- **Output**: `CritiqueResult` (strengths, weaknesses, gaps, score)
+
+#### Agent 5: Question Generator — `claude-sonnet-4-6`
+- Receives research findings (triggered separately via Kafka from the quiz app)
+- Formats them into TEKS-aligned quiz questions (question text, 4 options, correct answer, explanation)
+- **Output**: JSON array of quiz questions → saved to Postgres via `quiz.questions-ready` topic
+
+#### Agent 6: Study Plan Generator — `claude-haiku-4-5-20251001` (cost-optimised)
 - **Trigger**: Student completes a quiz while logged in
 - Receives quiz results (topic, score, wrong answers)
 - Generates a short personalised study plan in plain English
@@ -164,45 +178,99 @@ Agents run **inside the deployed application** whenever triggered via Kafka:
 
 ```
 RUNTIME AGENT FLOW (Question Generation)
-
+─────────────────────────────────────────────────────────────────────
 Admin (browser)
      │ POST /api/admin/generate-questions
      ▼
 Node Backend ──publish──▶ quiz.generate-questions (Kafka topic)
                                     │
-                    ┌───────────────▼────────────────┐
-                    │     Python Agent Worker         │
-                    │     (agent-worker container)    │
-                    │                                 │
-                    │  ┌──────────────────────────┐  │
-                    │  │  Orchestrator Agent       │  │
-                    │  │  Claude Sonnet            │  │
-                    │  │  tool: plan_research      │  │
-                    │  └──────────┬───────────────┘  │
-                    │    subtasks[]│                  │
-                    │  ┌──────────┼──────────┐       │
-                    │  ▼          ▼          ▼       │
-                    │ Researcher Researcher Researcher │
-                    │ Ollama     Ollama     Ollama    │
-                    │ (parallel, asyncio.Semaphore)   │
-                    │  └──────────┬──────────┘       │
-                    │    findings[]│                  │
-                    │  ┌──────────▼───────────────┐  │
-                    │  │  Question Generator Agent  │  │
-                    │  │  Claude Sonnet + caching   │  │
-                    │  └──────────┬───────────────┘  │
-                    └─────────────│──────────────────┘
-                                  │ publish
-                                  ▼
+                    ┌───────────────▼────────────────────────────┐
+                    │         Python Agent Worker                 │
+                    │         (agent-worker container)            │
+                    │                                             │
+                    │  ┌────────────────────────────────────┐    │
+                    │  │  1. ORCHESTRATOR  claude-sonnet-4-6 │    │
+                    │  │     Breaks topic into 2-5 subtasks  │    │
+                    │  │     Returns JSON with TEKS refs      │    │
+                    │  └──────────────────┬──────────────────┘    │
+                    │          subtasks[] │  (fast — ~1-2s)       │
+                    │  ┌───────────────── ┼ ──────────────┐       │
+                    │  ▼                  ▼                ▼       │
+                    │ Researcher      Researcher      Researcher   │
+                    │ Ollama local    Ollama local    Ollama local  │
+                    │ DuckDuckGo      URL fetch       URL fetch     │
+                    │ (asyncio.gather + Semaphore(3) — parallel)   │
+                    │  └──────────────────┬──────────────┘        │
+                    │          findings[] │                        │
+                    │  ┌─────────────────▼──────────────────┐    │
+                    │  │  3. ANALYST    claude-sonnet-4-6    │    │
+                    │  │     Synthesises findings into a      │    │
+                    │  │     structured AnalysisReport        │    │
+                    │  └─────────────────┬──────────────────┘    │
+                    │                    │                         │
+                    │  ┌─────────────────▼──────────────────┐    │
+                    │  │  4. CRITIC     claude-sonnet-4-6    │    │
+                    │  │     Reviews report, scores out of 10 │    │
+                    │  │     Surfaces gaps + improvements     │    │
+                    │  └─────────────────┬──────────────────┘    │
+                    │                    │                         │
+                    │  ┌─────────────────▼──────────────────┐    │
+                    │  │  5. QUESTION GEN claude-sonnet-4-6  │    │
+                    │  │     research findings → quiz Qs      │    │
+                    │  │     JSON: question, 4 options,        │    │
+                    │  │     correct answer, explanation       │    │
+                    │  └─────────────────┬──────────────────┘    │
+                    └─────────────────── │ ────────────────────────┘
+                                         │ publish
+                                         ▼
                     quiz.questions-ready (Kafka topic)
-                                  │
-Node Backend consumer ────────────▼
+                                         │
+Node Backend consumer ───────────────────▼
      │  INSERT INTO questions (Postgres)
      │  SET generation:{requestId} = done (Redis)
      ▼
 Admin polls /api/admin/generation-status/:id every 3s
      → status banner: "✅ 5 new questions generated!"
      → question list refreshes automatically
+
+### Real-Time Execution Log
+
+Running `python main.py "Texas Grade 6 math fractions"` shows the agents working live:
+
+```
+Pipeline started: 'Texas Grade 6 math fractions'
+
+[ORCHESTRATOR] Planning research: Texas Grade 6 math fractions
+[ORCHESTRATOR] Raw response: { "subtasks": [ ... ] }          ← Claude responds in ~1s
+[ORCHESTRATOR]   Subtask: 'Multiplying and Dividing Fractions' | TEKS: 6.3E
+[ORCHESTRATOR]   Subtask: 'Adding and Subtracting Fractions'   | TEKS: 6.3A
+[ORCHESTRATOR]   Subtask: 'Fractions, Decimals, and Percents'  | TEKS: 6.4E
+[ORCHESTRATOR]   Subtask: 'Rational Numbers on a Number Line'  | TEKS: 6.2A
+
+Running 4 research tasks concurrently...                       ← Ollama × 4 in parallel
+
+[RESEARCHER] Researching: Multiplying and Dividing Fractions (TEKS 6.3E)
+[RESEARCHER] Researching: Adding and Subtracting Fractions (TEKS 6.3A)
+[RESEARCHER] Researching: Fractions, Decimals, and Percents (TEKS 6.4E)
+[RESEARCHER]   Web search: 6 results for 'Multiplying and Dividing Fractions'
+[RESEARCHER]   Web search: 5 results for 'Fractions, Decimals, and Percents'
+[RESEARCHER]   Fetched 2 URL(s)
+[RESEARCHER]   Fetched 1 URL(s)
+
+[ANALYST] Synthesizing 4 research findings                     ← Claude
+[ANALYST] Analysis complete
+
+[CRITIC] Reviewing analysis report                             ← Claude
+[CRITIC] Review complete — score: 8.5/10
+```
+
+Key observations:
+- **Orchestrator** returns subtasks in ~1 second (Claude API, no local model startup)
+- **Researchers** run concurrently — wall time ≈ slowest single researcher, not sum of all
+- **Analyst** and **Critic** chain immediately after all findings are collected
+- The full pipeline completes in **~30–45 seconds** vs 3–5 minutes with Ollama for planning/analysis
+
+---
 
 RUNTIME AGENT FLOW (Study Plan)
 
@@ -283,16 +351,18 @@ agent-worker (Python 3.11 container)
 │     KafkaConsumer(quiz.generate-questions, group=question-gen-group)
 │     For each message:
 │       asyncio.run(run_pipeline(payload))
-│         → OrchestratorAgent.plan()        [Claude Sonnet, tool use]
-│         → ResearcherAgent.research() × N  [Ollama, parallel]
-│         → QuestionGeneratorAgent.generate() [Claude Sonnet, cached]
+│         → OrchestratorAgent.plan()         [Claude claude-sonnet-4-6]
+│         → ResearcherAgent.research() × N   [Ollama gpt-oss:20b, parallel]
+│         → AnalystAgent.analyze()           [Claude claude-sonnet-4-6]
+│         → CriticAgent.critique()           [Claude claude-sonnet-4-6]
+│         → QuestionGeneratorAgent.generate() [Claude claude-sonnet-4-6]
 │       producer.send(quiz.questions-ready, questions_json)
 │
 └── Thread: study-plan-pipeline
       KafkaConsumer(quiz.quiz-completed, group=study-plan-group)
       For each message (logged-in students only):
         asyncio.run(generate_plan(payload))
-          → Claude Haiku (cost-optimised)
+          → Claude claude-haiku-4-5-20251001 (cost-optimised)
         producer.send(quiz.study-plan-ready, plan_text)
 ```
 
@@ -438,25 +508,18 @@ EOF
 
 ### AI / Agent Layer
 
-| Tool | Model | Role |
-|------|-------|------|
-| Claude API (Anthropic) | `claude-sonnet-4-6` | Orchestrator, Analyst agents |
-| Claude API (Anthropic) | `claude-haiku-4-5-20251001` | Critic agent (cost-optimised) |
-| Ollama (local) | `gpt-oss:20b` | Developer / Researcher agent (free, private) |
-| Anthropic Python SDK | latest | Agent pipeline |
-| Pydantic v2 | 2.x | Typed inter-agent data schemas |
-
-### AI / Agent Layer
-
-| Tool | Model / Version | Role |
-|------|----------------|------|
-| Claude API (Anthropic) | `claude-sonnet-4-6` | Orchestrator, Analyst, Question Generator |
-| Claude API (Anthropic) | `claude-haiku-4-5-20251001` | Study Plan Generator (cost-optimised) |
-| Ollama (local) | `gpt-oss:20b` | Researcher agents (free, private, runs on host) |
-| Anthropic Python SDK | latest | All Claude API calls with prompt caching |
-| Pydantic v2 | 2.x | Typed inter-agent data schemas (`ResearchFinding`, etc.) |
-| kafka-python | 2.0.2 | Kafka producer/consumer in Python agent worker |
-| KafkaJS | 2.x | Kafka producer/consumer in Node.js backend |
+| Agent | Model | Runs via | Role |
+|-------|-------|----------|------|
+| Orchestrator | `claude-sonnet-4-6` | Claude API | Breaks topic into TEKS-aligned research subtasks |
+| Researcher × N | `gpt-oss:20b` | Ollama (local) | Concurrent DuckDuckGo search + URL fetch |
+| Analyst | `claude-sonnet-4-6` | Claude API | Synthesises findings into a structured report |
+| Critic | `claude-sonnet-4-6` | Claude API | Reviews report quality, scores out of 10 |
+| Question Generator | `claude-sonnet-4-6` | Claude API | Converts research into TEKS-aligned quiz questions |
+| Study Plan Generator | `claude-haiku-4-5-20251001` | Claude API | Personalised study plans (cost-optimised) |
+| Anthropic Python SDK | latest | — | All Claude API calls |
+| Pydantic v2 | 2.x | — | Typed inter-agent data schemas |
+| kafka-python | 2.0.2 | — | Kafka producer/consumer in Python agent worker |
+| KafkaJS | 2.x | — | Kafka producer/consumer in Node.js backend |
 
 ### DevOps & Infrastructure
 
@@ -524,9 +587,11 @@ EOF
                     │                                  │
                     │  Thread 1: question-pipeline     │
                     │  ┌──────────────────────────┐   │
-                    │  │ Orchestrator (Claude)     │   │
-                    │  │ Researchers × N (Ollama)  │   │
-                    │  │ Question Gen (Claude)     │   │
+                    │  │ Orchestrator  (Claude)    │   │
+                    │  │ Researcher×N  (Ollama)    │   │
+                    │  │ Analyst       (Claude)    │   │
+                    │  │ Critic        (Claude)    │   │
+                    │  │ Question Gen  (Claude)    │   │
                     │  └──────────────────────────┘   │
                     │                                  │
                     │  Thread 2: study-plan-pipeline   │
@@ -970,9 +1035,13 @@ docker compose up --build -d
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | — | Anthropic API key |
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server address |
-| `OLLAMA_MODEL` | `gpt-oss:20b` | Local Researcher agent model |
+| `ANTHROPIC_API_KEY` | — | Anthropic API key (required for all Claude agents) |
+| `ORCHESTRATOR_MODEL` | `claude-sonnet-4-6` | Model for Orchestrator agent |
+| `ANALYST_MODEL` | `claude-sonnet-4-6` | Model for Analyst agent |
+| `CRITIC_MODEL` | `claude-sonnet-4-6` | Model for Critic agent |
+| `QUESTION_GENERATOR_MODEL` | `claude-sonnet-4-6` | Model for Question Generator agent |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server address (Researcher agent only) |
+| `OLLAMA_MODEL` | `gpt-oss:20b` | Local model for Researcher agents |
 | `MAX_CONCURRENT_RESEARCHERS` | `3` | `asyncio.Semaphore` limit for parallel Ollama calls |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka broker for local dev |
 
