@@ -101,6 +101,69 @@ worker service.
 
 ---
 
+## From Ollama to Claude — Migration Story
+
+The pipeline originally used **Ollama** (`gpt-oss:20b`) running locally for the
+Researcher, Analyst, Critic, and Orchestrator agents. This caused a major bottleneck
+in production:
+
+### The Problem
+
+```
+[RESEARCHER] Researching: Multiplying and Dividing Fractions ...
+[RESEARCHER] Web search: 6 results                              ← fast (1-2s)
+[RESEARCHER] Fetched 2 URL(s)                                   ← fast (3-5s)
+                                                                 ... waiting ...
+                                                                 ... waiting ...
+                                                                 ... 3-5 minutes later
+[RESEARCHER] Complete                                            ← Ollama 20B was the bottleneck
+```
+
+With 4–5 concurrent researchers and a 20B parameter model running on CPU/limited GPU,
+each synthesis step took **3–5 minutes per agent**. The full pipeline took **15–25 minutes**
+per run. The Kafka-triggered question generation in the web app would time out before
+completing.
+
+### Root Cause
+
+Ollama runs inference locally — every researcher had to queue for the single local GPU.
+A 20B model requires significant compute per token, making parallel agent execution
+effectively sequential.
+
+### The Fix — Full Claude Migration
+
+All agents were migrated to the **Anthropic Claude API** in stages:
+
+| Stage | Agents moved to Claude | Impact |
+|-------|----------------------|--------|
+| 1 | Orchestrator, Critic | Planning instant, review fast |
+| 2 | Analyst | Synthesis dropped from 3 min → 3s |
+| 3 | Question Generator | Question writing instant |
+| 4 | Researcher (Haiku) | **The bottleneck eliminated** |
+
+Ollama was then fully removed — app, binary, models, pip package — from the codebase
+and the laptop.
+
+### Result
+
+```
+Pipeline started: 'Texas Grade 6 math fractions'
+[ORCHESTRATOR] Planning research ...          ← ~1s  (Claude Sonnet)
+Running 4 research tasks concurrently...
+[RESEARCHER] Complete: ... (conf 92%, 6 key points)   ← ~8s  (Claude Haiku)
+[RESEARCHER] Complete: ... (conf 92%, 7 key points)   ← ~8s
+[RESEARCHER] Complete: ... (conf 94%, 7 key points)   ← ~9s
+[RESEARCHER] Complete: ... (conf 85%, 7 key points)   ← ~10s
+[ANALYST] Analysis complete                   ← ~4s  (Claude Sonnet)
+[CRITIC] Review complete — score: 6.8/10      ← ~3s  (Claude Sonnet)
+Pipeline complete ✓
+```
+
+**Total time: ~35 seconds** vs 15–25 minutes with Ollama. No local GPU required.
+All 6 agents now run entirely on the Claude API — zero local infrastructure needed.
+
+---
+
 ## Multi-Agent AI Pipeline
 
 The project uses agents in **two distinct modes**:
@@ -512,12 +575,12 @@ EOF
 | Agent | Model | Runs via | Role |
 |-------|-------|----------|------|
 | Orchestrator | `claude-sonnet-4-6` | Claude API | Breaks topic into TEKS-aligned research subtasks |
-| Researcher × N | `gpt-oss:20b` | Ollama (local) | Concurrent DuckDuckGo search + URL fetch |
+| Researcher × N | `claude-haiku-4-5-20251001` | Claude API | Concurrent DuckDuckGo search + URL fetch + synthesis |
 | Analyst | `claude-sonnet-4-6` | Claude API | Synthesises findings into a structured report |
 | Critic | `claude-sonnet-4-6` | Claude API | Reviews report quality, scores out of 10 |
 | Question Generator | `claude-sonnet-4-6` | Claude API | Converts research into TEKS-aligned quiz questions |
 | Study Plan Generator | `claude-haiku-4-5-20251001` | Claude API | Personalised study plans (cost-optimised) |
-| Anthropic Python SDK | latest | — | All Claude API calls |
+| Anthropic Python SDK | latest | — | All Claude API calls — no local model required |
 | Pydantic v2 | 2.x | — | Typed inter-agent data schemas |
 | kafka-python | 2.0.2 | — | Kafka producer/consumer in Python agent worker |
 | KafkaJS | 2.x | — | Kafka producer/consumer in Node.js backend |
