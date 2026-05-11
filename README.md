@@ -1327,6 +1327,55 @@ kubectl exec -i statefulset/postgres -n mathquiz -- \
 
 ---
 
+## FAQ — Data & Deployment
+
+### Will student accounts survive a new deployment?
+
+**Yes.** Student accounts are stored in Postgres and persist across all normal
+deployment operations.
+
+When a student registers, their data is written directly to the Postgres PVC:
+
+```
+Student fills /register form
+        ↓
+POST /api/auth/register  →  bcrypt.hash(password)
+        ↓
+INSERT INTO users (name, email, password, role)
+        ↓
+Postgres PVC (postgres-data-postgres-0)
+        ↓  persists through:
+        ├── git push / CI/CD deploy          ✅
+        ├── kubectl rollout restart           ✅
+        ├── docker compose down && up         ✅
+        ├── pod crash + auto-restart          ✅
+        └── cluster node reboot              ✅
+```
+
+The same applies to **all user-generated data**:
+
+| Data | Survives deployment |
+|------|:-:|
+| Student accounts + passwords | ✅ |
+| Quiz scores + history | ✅ |
+| AI-generated questions | ✅ |
+| AI study plans | ✅ |
+| Active quiz sessions (mid-quiz) | ✅ (Redis PVC) |
+
+The only operations that delete student data require **explicit manual action**:
+
+```sh
+kubectl delete namespace mathquiz     # intentional full wipe
+kubectl delete pvc --all -n mathquiz  # intentional storage wipe
+docker compose down -v                # intentional volume wipe
+```
+
+Nothing in the normal CI/CD pipeline touches the PVC. You can deploy 100 times
+and every registered student, their quiz history, scores, and study plans will
+still be there.
+
+---
+
 ## Destroy & Recreate — Full Stack
 
 Use these procedures to cleanly tear down and rebuild the entire stack, whether
