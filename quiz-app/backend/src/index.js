@@ -47,6 +47,23 @@ function formatQuestion(q, number, total) {
            options: { a: q.option_a, b: q.option_b, c: q.option_c, d: q.option_d } };
 }
 
+// Fisher-Yates shuffle of answer options — remaps correct_option to new position
+function shuffleOptions(q) {
+  const keys = ['a', 'b', 'c', 'd'];
+  const order = [...keys];
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  // order[newPos] = oldKey  →  new slot at newPos gets text from old slot oldKey
+  const shuffled = { ...q };
+  order.forEach((oldKey, newIdx) => {
+    shuffled[`option_${keys[newIdx]}`] = q[`option_${oldKey}`];
+  });
+  shuffled.correct_option = keys[order.indexOf(q.correct_option)];
+  return shuffled;
+}
+
 function buildRecommendations(wrongCount, topicName, difficulty) {
   if (!wrongCount)     return [{ topic: '🏆 Perfect Score!', reason: `All ${topicName} ${difficulty} questions correct. Try a harder level!` }];
   if (wrongCount <= 3) return [{ topic: `📖 Review ${topicName}`, reason: `${wrongCount} wrong. Re-read explanations then retry.` }];
@@ -119,12 +136,15 @@ app.post('/api/quiz/start', optionalAuth, async (req, res) => {
     const topicName = topicRes.rows[0]?.name || 'Math';
     const sessionId = uuidv4();
 
+    // Shuffle answer options per question — different order every session
+    const questions = rows.map(shuffleOptions);
+
     await pool.query(
       'INSERT INTO quiz_sessions (id,topic_id,difficulty,total_q,user_id) VALUES ($1,$2,$3,$4,$5)',
-      [sessionId, topicId, difficulty, rows.length, userId]
+      [sessionId, topicId, difficulty, questions.length, userId]
     );
-    await setSession(sessionId, { topicId: Number(topicId), topicName, difficulty, questions: rows, currentIndex: 0 });
-    res.json({ sessionId, question: formatQuestion(rows[0], 1, rows.length) });
+    await setSession(sessionId, { topicId: Number(topicId), topicName, difficulty, questions, currentIndex: 0 });
+    res.json({ sessionId, question: formatQuestion(questions[0], 1, questions.length) });
   } catch (err) { console.error(err); res.status(500).json({ error: 'Failed to start quiz' }); }
 });
 
