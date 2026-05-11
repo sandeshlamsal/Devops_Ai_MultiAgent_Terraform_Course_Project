@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      apply_infra:
+        description: "Re-apply infra manifests (postgres/redis/kafka)? Only needed on first deploy or infra changes."
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 env:
   REGISTRY: ghcr.io
@@ -82,7 +89,7 @@ jobs:
           cache-from: type=gha
           cache-to:   type=gha,mode=max
 
-  # ── 2. Deploy to local K8s cluster ─────────────────────────────────────────
+  # ── 2. Deploy to Kubernetes ─────────────────────────────────────────────────
   deploy:
     name: Deploy to Kubernetes
     needs: build-and-push
@@ -102,18 +109,31 @@ jobs:
           echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
           chmod 600 $HOME/.kube/config
 
-      - name: Apply base manifests
+      # ── Infra: only on first deploy OR when manually triggered with apply_infra=true
+      # Postgres/Redis/Kafka are NOT re-applied on routine code pushes —
+      # this protects PVCs and running stateful services from unnecessary restarts.
+      - name: Apply infra manifests (first deploy / explicit trigger only)
+        if: ${{ github.event.inputs.apply_infra == 'true' || github.run_number == 1 }}
         run: |
           kubectl apply -f k8s/namespace.yaml
           kubectl apply -f k8s/configmap.yaml
           kubectl apply -f k8s/postgres/
           kubectl apply -f k8s/redis/
           kubectl apply -f k8s/kafka/
+
+      # ── App: applied on every push — safe, stateless deployments only
+      - name: Apply app manifests
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/configmap.yaml
           kubectl apply -f k8s/backend/
           kubectl apply -f k8s/frontend/
           kubectl apply -f k8s/agent-worker/
 
-      - name: Roll out new images
+      # ── Roll out new image versions to app deployments only
+      # Postgres image is intentionally NOT updated here — run with apply_infra=true
+      # only when you explicitly intend to update the DB container.
+      - name: Roll out new app images
         run: |
           P=${{ env.IMAGE_PREFIX }}
           T=${{ env.IMAGE_TAG }}

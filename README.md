@@ -1071,20 +1071,29 @@ The pipeline uses `GITHUB_TOKEN` (automatic OIDC) to push images — **no AWS ke
 
 ### Step 6 — First deployment
 
-```sh
-# Option A: push to main to trigger the pipeline automatically
-git push origin main
+**First deploy** — trigger manually with infra apply enabled:
+```
+GitHub → Actions → CI/CD — Build, Push & Deploy → Run workflow
+  → apply_infra: true   ← important on first run only
+```
 
-# Option B: trigger manually from GitHub UI
-# Actions → CI/CD — Build, Push & Deploy → Run workflow
+This applies postgres + redis + kafka manifests once and creates the PVCs.
+
+**All subsequent deploys** — push to `main` (infra is skipped automatically):
+```sh
+git push origin main
 ```
 
 The pipeline will:
-1. Build all 4 images and push to GHCR (tagged `latest` + 7-char SHA)
-2. Apply all K8s manifests (`k8s/`)
-3. Roll out new images to backend, frontend, agent-worker
-4. Wait for rollouts to complete
-5. Print running pods and services
+1. Build all 4 images → push to GHCR (tagged `latest` + 7-char SHA)
+2. Apply `namespace`, `configmap`, `backend`, `frontend`, `agent-worker` manifests
+3. **Skip postgres/redis/kafka** — stateful services are never restarted by routine pushes
+4. Roll out new images to backend, frontend, agent-worker only
+5. Wait for rollouts → print pod status
+
+> **Data safety**: Postgres data lives in a `volumeClaimTemplate` PVC.
+> It persists across pod restarts, image updates, and `kubectl apply` re-runs.
+> Only `kubectl delete namespace mathquiz` or `kubectl delete pvc` would remove it.
 
 ---
 
