@@ -164,6 +164,186 @@ All 6 agents now run entirely on the Claude API — zero local infrastructure ne
 
 ---
 
+## How the Agents Work Together
+
+Six specialised AI agents collaborate in a structured pipeline to power the quiz app.
+Each agent has one job, a defined input, and a defined output. No agent knows what
+another is doing — they communicate only through structured data contracts.
+
+Here is the complete story of what happens when an **admin clicks "Generate with AI"**
+for *"Grade 6 Algebra — Medium"*:
+
+---
+
+```
+ADMIN CLICKS "🤖 Generate with AI"
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  1. ORCHESTRATOR  (claude-sonnet-4-6)                                   │
+│                                                                         │
+│  Role: The Project Manager                                              │
+│  Job : Break a broad topic into focused, non-overlapping subtasks       │
+│                                                                         │
+│  Input : "Algebra — Medium — Grade 6"                                   │
+│  Output: 4 research subtasks, each with:                                │
+│          • A focused title                                              │
+│          • The exact TEKS standard code (e.g. 6.9A)                    │
+│          • A DuckDuckGo search query                                    │
+│          • 1-2 trusted reference URLs                                   │
+│                                                                         │
+│  Example output:                                                        │
+│    Subtask 1: "One-step equations" | TEKS 6.9A                          │
+│    Subtask 2: "Two-step inequalities" | TEKS 6.9B                       │
+│    Subtask 3: "Writing expressions from word problems" | TEKS 6.7A     │
+│    Subtask 4: "Tables, graphs, and equations" | TEKS 6.6A              │
+└─────────────────────────────────────┬───────────────────────────────────┘
+                                      │  4 subtasks
+                        ┌─────────────┼─────────────┐
+                        ▼             ▼             ▼  (+ 1 queued)
+┌───────────────────────────────────────────────────────────────────────┐
+│  2. RESEARCHER × 4  (claude-haiku-4-5-20251001)                       │
+│                                                                       │
+│  Role: The Field Researchers (run in parallel)                        │
+│  Job : Go out to the web, gather real curriculum content,             │
+│        and synthesise it into structured findings                     │
+│                                                                       │
+│  Input : One subtask from the Orchestrator                            │
+│  Steps :                                                              │
+│    a) Read official Texas TEKS standards for the topic               │
+│    b) Run DuckDuckGo search (e.g. "TEKS 6.9A one-step equations")    │
+│    c) Fetch and scrape 1-2 reference URLs (Khan Academy, IXL, etc.)  │
+│    d) Synthesise all real content into a ResearchFinding             │
+│                                                                       │
+│  Example output (for subtask 1):                                      │
+│    Title     : "One-step equations"                                   │
+│    Summary   : "Grade 6 students solve equations like x + 5 = 12     │
+│                using inverse operations. TEKS 6.9A requires..."       │
+│    Key points: ["Use inverse operations to isolate the variable",     │
+│                 "Check solution by substituting back",                │
+│                 "Common error: applying operation to wrong side", ...] │
+│    Confidence: 92%                                                    │
+└──────────────────────────────────────┬────────────────────────────────┘
+                                       │  4 ResearchFindings
+                                       ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│  3. ANALYST  (claude-sonnet-4-6)                                      │
+│                                                                       │
+│  Role: The Senior Analyst                                             │
+│  Job : Read all 4 research findings and synthesise them into one     │
+│        coherent analysis report                                       │
+│                                                                       │
+│  Input : 4 ResearchFindings from the Researchers                      │
+│  Output: AnalysisReport with:                                         │
+│    • Executive summary of what Grade 6 Algebra covers                │
+│    • Key insights across all subtopics                               │
+│    • Detailed findings per area                                      │
+│    • Conclusions on what students find hardest                       │
+│    • Recommendations for question types                              │
+│                                                                       │
+│  Example output:                                                      │
+│    Summary: "Grade 6 algebra focuses on building equation-solving     │
+│             foundations. Students must master inverse operations      │
+│             before tackling two-step problems..."                     │
+│    Insight: "Word problems are the highest-difficulty area —          │
+│              students struggle with translating language to algebra"  │
+└──────────────────────────────────────┬────────────────────────────────┘
+                                       │  AnalysisReport
+                                       ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│  4. CRITIC  (claude-sonnet-4-6)                                       │
+│                                                                       │
+│  Role: The Quality Reviewer                                           │
+│  Job : Independently review the Analyst's report for gaps,           │
+│        logical inconsistencies, and missed opportunities              │
+│                                                                       │
+│  Input : AnalysisReport from the Analyst                              │
+│  Output: CritiqueResult with:                                         │
+│    • Strengths of the analysis                                       │
+│    • Weaknesses or blind spots                                       │
+│    • Gaps (topics not covered)                                       │
+│    • Improved recommendations                                        │
+│    • Overall score out of 10                                         │
+│                                                                       │
+│  Example output:                                                      │
+│    Strength  : "Strong TEKS alignment across all subtopics"           │
+│    Weakness  : "Missing coverage of negative number substitution"     │
+│    Gap       : "No mention of graphing equations on coordinate plane" │
+│    Score     : 7.2/10                                                 │
+└──────────────────────────────────────┬────────────────────────────────┘
+                    (critique improves │  the final question quality)
+                                       ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│  5. QUESTION GENERATOR  (claude-sonnet-4-6)                           │
+│                                                                       │
+│  Role: The Curriculum Writer                                          │
+│  Job : Turn the research findings into polished, TEKS-aligned         │
+│        multiple-choice quiz questions                                 │
+│                                                                       │
+│  Input : All 4 ResearchFindings + topic/difficulty/count             │
+│  Output: JSON array of quiz questions, each with:                    │
+│    • question_text                                                   │
+│    • option_a, option_b, option_c, option_d (shuffled on delivery)  │
+│    • correct_option                                                  │
+│    • explanation (step-by-step solution)                             │
+│                                                                       │
+│  Example output:                                                      │
+│    Q: "Solve for x: x + 7 = 15"                                      │
+│    A) x = 8  ← correct     B) x = 22                                 │
+│    C) x = 7               D) x = 105                                 │
+│    Explanation: "Subtract 7 from both sides: x = 15 - 7 = 8"        │
+└──────────────────────────────────────┬────────────────────────────────┘
+                                       │  questions JSON → Kafka
+                                       ▼
+                              Saved to Postgres
+                          Admin sees new questions appear
+                           Students get a better quiz ✓
+```
+
+---
+
+### When a student completes a quiz (logged in):
+
+```
+Student submits final answer
+        ↓
+┌───────────────────────────────────────────────────────────────────────┐
+│  6. STUDY PLAN GENERATOR  (claude-haiku-4-5-20251001)                 │
+│                                                                       │
+│  Role: The Personal Tutor                                             │
+│  Job : Analyse the student's quiz results and write a personalised   │
+│        study plan targeting their specific weak areas                │
+│                                                                       │
+│  Input : topic, score %, list of wrong answers with correct answers  │
+│  Output: Plain-English markdown study plan                           │
+│                                                                       │
+│  Example output:                                                      │
+│    "Great effort on Medium Algebra! Here's your plan:                │
+│     • You missed 3 questions on one-step equations.                  │
+│       Focus: practice isolating the variable with addition first.    │
+│     • Try Khan Academy: cc-sixth-grade-math/cc-6th-equations         │
+│     • Work 5 practice problems daily for the next 3 days"           │
+└───────────────────────────────────────────────────────────────────────┘
+        ↓
+Saved to student_study_plans table
+Student Dashboard shows "🤖 AI Study Plan" within ~15 seconds
+```
+
+---
+
+### Why this multi-agent design?
+
+| Design choice | Reason |
+|--------------|--------|
+| Separate Orchestrator | One agent planning prevents researchers duplicating subtopics |
+| Parallel Researchers | 4 subtopics researched simultaneously — 4× faster than sequential |
+| Haiku for Researcher | High-volume synthesis; speed + cost matter more than depth |
+| Separate Analyst | Sees the full picture across all findings; Researchers only see one |
+| Separate Critic | Independent review catches gaps the Analyst missed |
+| Sonnet for Analyst/Critic | Complex reasoning tasks where quality matters most |
+| Haiku for Study Plans | Personal, short-form output — fast and cheap at high volume |
+| Kafka between web app and agents | Admin/student gets instant response; agents run async in background |
+
 ## Multi-Agent AI Pipeline
 
 The project uses agents in **two distinct modes**:
