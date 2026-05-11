@@ -1264,6 +1264,189 @@ kubectl exec -i statefulset/postgres -n mathquiz -- \
 
 ---
 
+## Destroy & Recreate — Full Stack
+
+Use these procedures to cleanly tear down and rebuild the entire stack, whether
+running on Kubernetes or Docker Compose.
+
+---
+
+### Option A — Kubernetes (kubectl)
+
+#### Soft destroy — wipe app, keep data
+
+Removes all pods and services but leaves PVCs intact.
+Data is safe. Recreate the stack in seconds.
+
+```sh
+# Tear down app + infra services (PVCs survive)
+kubectl delete -f k8s/agent-worker/
+kubectl delete -f k8s/frontend/
+kubectl delete -f k8s/backend/
+kubectl delete -f k8s/kafka/
+kubectl delete -f k8s/redis/
+kubectl delete -f k8s/postgres/
+
+# Verify PVCs still exist (your data is here)
+kubectl get pvc -n mathquiz
+
+# Recreate everything
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/postgres/
+kubectl apply -f k8s/redis/
+kubectl apply -f k8s/kafka/
+kubectl apply -f k8s/backend/
+kubectl apply -f k8s/frontend/
+kubectl apply -f k8s/agent-worker/
+```
+
+---
+
+#### Hard destroy — wipe everything including data
+
+⚠️ This permanently deletes all database rows, user accounts, quiz history, and AI-generated questions.
+**Take a backup first.**
+
+```sh
+# Step 1 — Backup (do this first!)
+kubectl exec statefulset/postgres -n mathquiz -- \
+  pg_dump -U postgres mathquiz > backup-$(date +%Y%m%d-%H%M).sql
+
+# Step 2 — Wipe the entire namespace (deletes PVCs + all data)
+kubectl delete namespace mathquiz
+
+# Confirm everything is gone
+kubectl get all,pvc -n mathquiz   # should return "No resources found"
+```
+
+---
+
+#### Full recreate after hard destroy
+
+```sh
+# Step 1 — Re-apply Terraform (recreates namespace + deploy role)
+cd terraform && terraform apply && cd ..
+
+# Step 2 — Recreate secrets
+kubectl apply -f k8s/secret.yaml
+
+# Step 3 — Apply infra (creates fresh PVCs + starts postgres/redis/kafka)
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/postgres/
+kubectl apply -f k8s/redis/
+kubectl apply -f k8s/kafka/
+
+# Step 4 — Wait for postgres to be ready
+kubectl wait --for=condition=ready pod/postgres-0 -n mathquiz --timeout=90s
+
+# Step 5 — Restore from backup (skip if starting fresh)
+kubectl exec -i statefulset/postgres -n mathquiz -- \
+  psql -U postgres mathquiz < backup-20240510-1430.sql
+
+# Step 6 — Deploy app services
+kubectl apply -f k8s/backend/
+kubectl apply -f k8s/frontend/
+kubectl apply -f k8s/agent-worker/
+
+# Step 7 — Verify
+kubectl get pods -n mathquiz
+open http://localhost:30080
+```
+
+---
+
+#### Recreate via CI/CD pipeline (no CLI needed)
+
+```
+GitHub → Actions → CI/CD — Build, Push & Deploy
+  → Run workflow
+  → apply_infra: true     ← required after a hard destroy
+```
+
+The pipeline will build fresh images, apply all manifests, and roll out the stack.
+Set `apply_infra: true` only on the first run after a hard destroy — all subsequent
+pushes leave infra alone.
+
+---
+
+### Option B — Docker Compose
+
+#### Soft destroy — wipe containers, keep data
+
+```sh
+# Stop and remove containers (named volume postgres_data survives)
+docker compose down
+
+# Verify volume still exists
+docker volume ls | grep postgres_data
+
+# Bring everything back up
+docker compose up -d
+
+# Verify
+docker compose ps
+curl http://localhost:3001/api/topics
+open http://localhost:3000
+```
+
+---
+
+#### Hard destroy — wipe everything including data
+
+⚠️ Take a backup first.
+
+```sh
+# Step 1 — Backup
+docker exec devops_ai_multiagent_terraform_course_project-postgres-1 \
+  pg_dump -U postgres mathquiz > backup-$(date +%Y%m%d-%H%M).sql
+
+# Step 2 — Wipe containers AND volumes
+docker compose down -v
+
+# Confirm volume is gone
+docker volume ls | grep postgres_data   # should return nothing
+```
+
+---
+
+#### Full recreate after hard destroy (Docker Compose)
+
+```sh
+# Step 1 — Rebuild all images and start fresh
+docker compose up --build -d
+
+# Step 2 — Wait for postgres to initialise (runs initdb + migrations)
+docker compose logs -f postgres
+# Wait for: "database system is ready to accept connections"
+
+# Step 3 — Restore from backup (skip if starting fresh)
+docker exec -i devops_ai_multiagent_terraform_course_project-postgres-1 \
+  psql -U postgres mathquiz < backup-20240510-1430.sql
+
+# Step 4 — Verify
+docker compose ps
+curl http://localhost:3001/api/topics
+open http://localhost:3000
+```
+
+---
+
+### Destroy & Recreate — Decision Matrix
+
+| Scenario | Command | Data lost? |
+|----------|---------|-----------|
+| Restart a single service | `kubectl rollout restart deployment/backend -n mathquiz` | No |
+| Restart all pods, keep data | `kubectl delete -f k8s/ --recursive` then `kubectl apply -f k8s/` | No |
+| Full K8s wipe, keep data | Delete deployments/StatefulSets, leave PVCs | No |
+| Full K8s wipe + data | `kubectl delete namespace mathquiz` | **Yes — backup first** |
+| Docker Compose restart | `docker compose down && docker compose up -d` | No |
+| Docker Compose full wipe | `docker compose down -v` | **Yes — backup first** |
+| Rebuild images only | `docker compose build` or CI/CD push | No |
+| New cluster from scratch | Terraform apply → K8s apply → restore backup | No (from backup) |
+
+---
+
 ## Deployment — Docker Desktop
 
 ### Prerequisites
