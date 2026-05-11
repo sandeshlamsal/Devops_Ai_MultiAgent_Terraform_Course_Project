@@ -1,13 +1,17 @@
-import { useEffect, useState } from 'react';
-import { getAdminQuestions, getTopics, addQuestion, updateQuestion, deleteQuestion } from '../../api/client';
+import { useEffect, useState, useRef } from 'react';
+import { getAdminQuestions, getTopics, addQuestion, updateQuestion, deleteQuestion, generateQuestions, getGenerationStatus } from '../../api/client';
 import AdminLayout from './AdminLayout';
 
 const BLANK = { topic_id: '', difficulty: 'easy', question_text: '', option_a: '', option_b: '', option_c: '', option_d: '', correct_option: 'a', explanation: '' };
+const AI_BLANK = { topic_id: '', difficulty: 'medium', count: 5 };
 
 export default function AdminQuestions() {
   const [questions, setQuestions] = useState([]);
   const [topics,    setTopics]    = useState([]);
   const [filter,    setFilter]    = useState({ topic_id: '', difficulty: '' });
+  const [aiForm,    setAiForm]    = useState(null);   // null = closed, AI_BLANK = open
+  const [aiStatus,  setAiStatus]  = useState(null);  // { status, count, error }
+  const pollRef = useRef(null);
   const [form,      setForm]      = useState(null);  // null = closed, BLANK = add, {...} = edit
   const [loading,   setLoading]   = useState(true);
   const [saving,    setSaving]    = useState(false);
@@ -23,6 +27,29 @@ export default function AdminQuestions() {
     setTopics(ts);
     setLoading(false);
   };
+
+  const startAiGeneration = async (e) => {
+    e.preventDefault();
+    setAiStatus({ status: 'pending' });
+    try {
+      const { requestId } = await generateQuestions(aiForm);
+      // Poll for completion
+      pollRef.current = setInterval(async () => {
+        try {
+          const s = await getGenerationStatus(requestId);
+          setAiStatus(s);
+          if (s.status === 'done' || s.status === 'error') {
+            clearInterval(pollRef.current);
+            if (s.status === 'done') { load(); }
+          }
+        } catch { clearInterval(pollRef.current); }
+      }, 3000);
+    } catch (err) {
+      setAiStatus({ status: 'error', error: err.response?.data?.error || 'Failed to start' });
+    }
+  };
+
+  useEffect(() => () => clearInterval(pollRef.current), []);
 
   useEffect(() => { load(); }, [filter]);
 
@@ -54,8 +81,32 @@ export default function AdminQuestions() {
       <div className="admin-page">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
           <h2 className="admin-page-title" style={{ margin: 0 }}>Questions ({questions.length})</h2>
-          <button className="btn btn-primary" style={{ padding: '10px 18px' }} onClick={() => setForm({ ...BLANK })}>+ Add Question</button>
+          <div style={{ display: 'flex', gap: 10 }}>
+            <button
+              className="btn btn-outline"
+              style={{ padding: '10px 18px', borderColor: '#8b5cf6', color: '#8b5cf6' }}
+              onClick={() => { setAiForm({ ...AI_BLANK }); setAiStatus(null); }}
+            >
+              🤖 Generate with AI
+            </button>
+            <button className="btn btn-primary" style={{ padding: '10px 18px' }} onClick={() => setForm({ ...BLANK })}>+ Add Question</button>
+          </div>
         </div>
+
+        {/* AI generation status banner */}
+        {aiStatus && (
+          <div style={{
+            padding: '12px 16px', borderRadius: 10, marginBottom: 16,
+            background: aiStatus.status === 'done' ? '#d1fae5' : aiStatus.status === 'error' ? '#fee2e2' : '#ede9fe',
+            color: aiStatus.status === 'done' ? '#065f46' : aiStatus.status === 'error' ? '#991b1b' : '#5b21b6',
+            fontWeight: 600, fontSize: '.9rem',
+          }}>
+            {aiStatus.status === 'pending'  && '⏳ Sending request to AI agents via Kafka…'}
+            {aiStatus.status === 'done'     && `✅ ${aiStatus.count} new questions generated and saved!`}
+            {aiStatus.status === 'error'    && `❌ Generation failed: ${aiStatus.error}`}
+            {!['pending','done','error'].includes(aiStatus.status) && `🤖 Agents working… (${aiStatus.status})`}
+          </div>
+        )}
 
         {/* Filters */}
         <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
@@ -99,6 +150,50 @@ export default function AdminQuestions() {
                 </div>
               ))
             }
+          </div>
+        )}
+
+        {/* AI Generation modal */}
+        {aiForm && (
+          <div className="admin-modal-overlay" onClick={() => setAiForm(null)}>
+            <div className="admin-modal" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                <h3 style={{ margin: 0 }}>🤖 Generate Questions with AI</h3>
+                <button onClick={() => setAiForm(null)} style={{ background: 'none', border: 'none', fontSize: '1.4rem', cursor: 'pointer', color: 'var(--text-muted)' }}>✕</button>
+              </div>
+              <p style={{ color: 'var(--text-muted)', fontSize: '.88rem', marginBottom: 20 }}>
+                Multi-agent pipeline: Orchestrator → Researchers (Ollama) → Question Generator (Claude) → Kafka → DB
+              </p>
+              <form onSubmit={startAiGeneration} className="admin-form">
+                <div className="auth-field">
+                  <label>Topic</label>
+                  <select className="admin-select" style={{ width: '100%' }} value={aiForm.topic_id}
+                    onChange={e => setAiForm(f => ({ ...f, topic_id: e.target.value }))} required>
+                    <option value="">Select topic…</option>
+                    {topics.map(t => <option key={t.id} value={t.id}>{t.icon} {t.name}</option>)}
+                  </select>
+                </div>
+                <div className="auth-field">
+                  <label>Difficulty</label>
+                  <select className="admin-select" style={{ width: '100%' }} value={aiForm.difficulty}
+                    onChange={e => setAiForm(f => ({ ...f, difficulty: e.target.value }))}>
+                    <option value="easy">Easy</option>
+                    <option value="medium">Medium</option>
+                    <option value="hard">Hard</option>
+                  </select>
+                </div>
+                <div className="auth-field">
+                  <label>Number of questions (1–10)</label>
+                  <input type="number" min={1} max={10} value={aiForm.count}
+                    onChange={e => setAiForm(f => ({ ...f, count: Number(e.target.value) }))} />
+                </div>
+                <button type="submit" className="auth-btn"
+                  style={{ background: 'linear-gradient(135deg,#8b5cf6,#6366f1)' }}
+                  disabled={aiStatus?.status === 'pending'}>
+                  {aiStatus?.status === 'pending' ? '⏳ Agents working…' : '🚀 Start Generation'}
+                </button>
+              </form>
+            </div>
           </div>
         )}
 

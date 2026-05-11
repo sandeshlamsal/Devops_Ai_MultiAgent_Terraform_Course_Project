@@ -6,8 +6,10 @@ const { v4: uuidv4 } = require('uuid');
 const fs       = require('fs');
 const path     = require('path');
 const pool     = require('./db/postgres');
-const { setSession, getSession, deleteSession } = require('./db/redis');
-const { optionalAuth, JWT_SECRET } = require('./middleware/auth');
+const redisDb  = require('./db/redis');
+const { setSession, getSession, deleteSession, redis: redisClient } = redisDb;
+const { optionalAuth, authenticate, requireAdmin, JWT_SECRET } = require('./middleware/auth');
+const kafka    = require('./kafka');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -58,6 +60,43 @@ function buildRecommendations(wrongCount, topicName, difficulty) {
 app.use('/api/auth',    require('./routes/auth'));
 app.use('/api/admin',   require('./routes/admin'));
 app.use('/api/student', require('./routes/student'));
+
+// ── AI Question Generation (Kafka-backed) ─────────────────────────────────────
+app.post('/api/admin/generate-questions', authenticate, requireAdmin, async (req, res) => {
+  const { topicId, difficulty = 'medium', count = 5 } = req.body;
+  try {
+    const topicRes = await pool.query('SELECT name FROM topics WHERE id = $1', [topicId]);
+    if (!topicRes.rows.length) return res.status(400).json({ error: 'Invalid topicId' });
+
+    const requestId = uuidv4();
+
+    // Store initial status in Redis
+    await redisClient.setex(
+      `generation:${requestId}`, 600,
+      JSON.stringify({ status: 'pending', count: 0, error: null })
+    );
+
+    // Publish to Kafka → Python agent worker picks it up
+    await kafka.publish(kafka.TOPICS.GENERATE_QUESTIONS, {
+      requestId,
+      topicId:   Number(topicId),
+      topicName: topicRes.rows[0].name,
+      difficulty,
+      count:     Number(count),
+    });
+
+    res.json({ requestId, message: 'Generation started — poll /api/admin/generation-status/:requestId' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to start generation' });
+  }
+});
+
+app.get('/api/admin/generation-status/:requestId', authenticate, requireAdmin, async (req, res) => {
+  const raw = await redisClient.get(`generation:${req.params.requestId}`);
+  if (!raw) return res.status(404).json({ error: 'Request not found or expired' });
+  res.json(JSON.parse(raw));
+});
 
 app.get('/api/topics', async (_req, res) => {
   try {
@@ -121,6 +160,27 @@ app.post('/api/quiz/:sessionId/answer', async (req, res) => {
         [correct, scorePct, sessionId]
       );
       await deleteSession(sessionId);
+
+      // Publish quiz-completed event for study plan generation
+      if (session.userId) {
+        const allAnswers = await pool.query(
+          'SELECT * FROM session_answers WHERE session_id=$1 ORDER BY id', [sessionId]
+        );
+        const wrongAnswers = allAnswers.rows
+          .filter(a => !a.is_correct)
+          .map(a => ({ questionText: a.question_text, chosenText: a[`option_${a.chosen_option}`], correctText: a[`option_${a.correct_option}`] }));
+
+        const userRes = await pool.query('SELECT name FROM users WHERE id=$1', [session.userId]);
+        kafka.publish(kafka.TOPICS.QUIZ_COMPLETED, {
+          sessionId,
+          userId:       session.userId,
+          studentName:  userRes.rows[0]?.name,
+          topicName:    session.topicName,
+          difficulty:   session.difficulty,
+          scorePercent: Math.round((correct / session.questions.length) * 100),
+          wrongAnswers,
+        }).catch(err => console.error('Kafka publish error:', err.message));
+      }
     }
 
     const response = { isCorrect, correctOption: q.correct_option, explanation: q.explanation, hasNext };
@@ -173,6 +233,15 @@ app.get('/api/history', async (_req, res) => {
 async function boot() {
   await runMigrations();
   await seedAdmin();
+
+  // Kafka — non-fatal if unavailable (quiz app works without it)
+  try {
+    await kafka.connectProducer();
+    await kafka.connectConsumer();
+  } catch (err) {
+    console.warn('Kafka unavailable — AI generation disabled:', err.message);
+  }
+
   app.listen(PORT, () => console.log(`Quiz API → http://localhost:${PORT}`));
 }
 
