@@ -14,6 +14,10 @@ class Subtask(BaseModel):
     title: str
     description: str
     focus_areas: list[str]
+    # Real data source fields — set by Orchestrator, used by Researcher
+    search_query:   str       = ""    # DuckDuckGo query to fetch real content
+    teks_ref:       str       = ""    # Texas TEKS standard code (e.g. "6.7A")
+    reference_urls: list[str] = []    # Specific URLs to read
 
 
 class ResearchFinding(BaseModel):
