@@ -1164,6 +1164,106 @@ kubectl delete namespace mathquiz
 
 ---
 
+### Data Safety — What Deletes What
+
+The PVC **is** where Postgres stores all its data. There is no separate copy.
+
+```
+PVC (postgres-data-postgres-0)
+  └── /var/lib/postgresql/data    ← ALL Postgres files live here
+        ├── questions table       (seeded + AI-generated)
+        ├── users table           (accounts + passwords)
+        ├── quiz_sessions table   (scores + history)
+        └── study_plans table     (AI study plans)
+```
+
+| Operation | Questions | Users | Scores | Sessions (Redis) |
+|-----------|:---------:|:-----:|:------:|:----------------:|
+| `git push` / CI/CD deploy | ✅ | ✅ | ✅ | ✅ |
+| `kubectl rollout restart` | ✅ | ✅ | ✅ | ✅ |
+| `kubectl apply -f k8s/` | ✅ | ✅ | ✅ | ✅ |
+| `kubectl delete pod postgres-0` | ✅ | ✅ | ✅ | ✅ |
+| `kubectl delete pvc --all` | ❌ | ❌ | ❌ | ❌ |
+| `kubectl delete namespace mathquiz` | ❌ | ❌ | ❌ | ❌ |
+
+---
+
+### Backup & Restore
+
+#### Take a backup (run before any risky operation)
+
+```sh
+# Dump entire database to a local SQL file
+kubectl exec statefulset/postgres -n mathquiz -- \
+  pg_dump -U postgres mathquiz > backup-$(date +%Y%m%d-%H%M).sql
+
+# Verify it looks right
+head -20 backup-*.sql
+wc -l  backup-*.sql    # expect thousands of lines
+```
+
+#### Automated daily backup (Kubernetes CronJob)
+
+```sh
+kubectl create cronjob pg-backup \
+  --image=ghcr.io/sandeshlamsal/quiz-postgres:latest \
+  --schedule="0 2 * * *" \
+  --namespace=mathquiz \
+  -- sh -c 'pg_dump -U postgres -h postgres mathquiz | gzip > /tmp/backup-$(date +%Y%m%d).sql.gz && echo "Backup OK: $(du -sh /tmp/backup-*.sql.gz)"'
+```
+
+#### Restore after PVC is deleted (full recovery)
+
+If `kubectl delete pvc` or `kubectl delete namespace` was run, follow these steps:
+
+```sh
+# Step 1 — Recreate namespace + secrets + infra (triggers first-time PVC creation)
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/secret.yaml          # must exist — see secret.yaml.example
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/postgres/
+kubectl apply -f k8s/redis/
+kubectl apply -f k8s/kafka/
+
+# Step 2 — Wait for postgres to be ready (initdb runs on empty PVC)
+kubectl wait --for=condition=ready pod/postgres-0 -n mathquiz --timeout=60s
+
+# Step 3 — Restore from backup
+kubectl exec -i statefulset/postgres -n mathquiz -- \
+  psql -U postgres mathquiz < backup-20240510-1430.sql
+
+# Step 4 — Verify row counts
+kubectl exec statefulset/postgres -n mathquiz -- \
+  psql -U postgres mathquiz -c "
+    SELECT 'topics'       AS tbl, COUNT(*) FROM topics
+    UNION ALL
+    SELECT 'questions',          COUNT(*) FROM questions
+    UNION ALL
+    SELECT 'users',              COUNT(*) FROM users
+    UNION ALL
+    SELECT 'quiz_sessions',      COUNT(*) FROM quiz_sessions
+    UNION ALL
+    SELECT 'study_plans',        COUNT(*) FROM student_study_plans;"
+
+# Step 5 — Redeploy app services
+kubectl apply -f k8s/backend/
+kubectl apply -f k8s/frontend/
+kubectl apply -f k8s/agent-worker/
+```
+
+#### Restore from Docker Compose backup (if migrating to K8s)
+
+```sh
+# Dump from running Docker Compose stack
+docker exec <postgres-container> pg_dump -U postgres mathquiz > backup.sql
+
+# Restore into K8s cluster
+kubectl exec -i statefulset/postgres -n mathquiz -- \
+  psql -U postgres mathquiz < backup.sql
+```
+
+---
+
 ## Deployment — Docker Desktop
 
 ### Prerequisites
