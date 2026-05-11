@@ -2,16 +2,43 @@ import axios from 'axios';
 
 const api = axios.create({ baseURL: '/api' });
 
-export const getTopics = () => api.get('/topics').then((r) => r.data);
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('token');
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
 
-export const startQuiz = (topicId, difficulty = 'easy') =>
-  api.post('/quiz/start', { topicId, difficulty }).then((r) => r.data);
+api.interceptors.response.use(
+  (r) => r,
+  (err) => {
+    if (err.response?.status === 401) {
+      localStorage.removeItem('token');
+      localStorage.removeItem('user');
+    }
+    return Promise.reject(err);
+  }
+);
 
-export const submitAnswer = (sessionId, chosenOption) =>
-  api.post(`/quiz/${sessionId}/answer`, { chosenOption }).then((r) => r.data);
+export const getTopics   = () => api.get('/topics').then(r => r.data);
+export const startQuiz   = (topicId, difficulty = 'easy') => api.post('/quiz/start', { topicId, difficulty }).then(r => r.data);
+export const submitAnswer= (sessionId, chosenOption) => api.post(`/quiz/${sessionId}/answer`, { chosenOption }).then(r => r.data);
+export const getSummary  = (sessionId) => api.get(`/quiz/${sessionId}/summary`).then(r => r.data);
+export const getHistory  = () => api.get('/history').then(r => r.data);
 
-export const getSummary = (sessionId) =>
-  api.get(`/quiz/${sessionId}/summary`).then((r) => r.data);
+// Auth
+export const register    = (data) => api.post('/auth/register', data).then(r => r.data);
+export const login       = (data) => api.post('/auth/login', data).then(r => r.data);
+export const getMe       = () => api.get('/auth/me').then(r => r.data);
 
-export const getHistory = () =>
-  api.get('/history').then((r) => r.data);
+// Student
+export const getStudentHistory = () => api.get('/student/history').then(r => r.data);
+export const getStudentStats   = () => api.get('/student/stats').then(r => r.data);
+
+// Admin
+export const getAdminStats    = () => api.get('/admin/stats').then(r => r.data);
+export const getAdminStudents = () => api.get('/admin/students').then(r => r.data);
+export const getStudentProgress = (id) => api.get(`/admin/students/${id}/progress`).then(r => r.data);
+export const getAdminQuestions  = (params) => api.get('/admin/questions', { params }).then(r => r.data);
+export const addQuestion        = (data) => api.post('/admin/questions', data).then(r => r.data);
+export const updateQuestion     = (id, data) => api.put(`/admin/questions/${id}`, data).then(r => r.data);
+export const deleteQuestion     = (id) => api.delete(`/admin/questions/${id}`).then(r => r.data);

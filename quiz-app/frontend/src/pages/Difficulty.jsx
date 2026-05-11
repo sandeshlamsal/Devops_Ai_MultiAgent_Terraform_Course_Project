@@ -1,4 +1,4 @@
-import { useParams, useLocation, useNavigate } from 'react-router-dom';
+import { useParams, useLocation, useNavigate, Link } from 'react-router-dom';
 
 const LEVELS = [
   {
@@ -48,12 +48,14 @@ export default function Difficulty() {
       </div>
 
       <div className="container" style={{ padding: '0 20px' }}>
-        <button
-          onClick={() => navigate('/')}
-          style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', margin: '24px 0 8px', fontSize: '0.9rem' }}
-        >
-          ← Back to topics
-        </button>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', margin: '20px 0 8px' }}>
+          <button onClick={() => navigate('/')} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '0.9rem' }}>
+            ← Back to topics
+          </button>
+          <Link to={`/formulas/${topicId}`} style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--primary)', textDecoration: 'none', background: 'var(--primary-light)', padding: '6px 14px', borderRadius: '99px' }}>
+            📐 View Formulas
+          </Link>
+        </div>
 
         <div className="difficulty-grid">
           {LEVELS.map((level) => (

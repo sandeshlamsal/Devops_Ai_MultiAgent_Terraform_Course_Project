@@ -1,0 +1,65 @@
+services:
+
+  postgres:
+    build:
+      context: ./quiz-app/postgres
+      dockerfile: Dockerfile
+    image: ghcr.io/sandeshlamsal/quiz-postgres:latest
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       mathquiz
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mathquiz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: ./quiz-app/backend
+      dockerfile: Dockerfile
+    image: ghcr.io/sandeshlamsal/quiz-backend:latest
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/mathquiz
+      REDIS_URL:    redis://redis:6379
+      FRONTEND_URL: http://localhost:3000
+      PORT:         3001
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./quiz-app/frontend
+      dockerfile: Dockerfile
+    image: ghcr.io/sandeshlamsal/quiz-frontend:latest
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:

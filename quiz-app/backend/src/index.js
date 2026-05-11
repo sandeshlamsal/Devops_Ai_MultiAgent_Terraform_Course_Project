@@ -1,101 +1,97 @@
 require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
+const express  = require('express');
+const cors     = require('cors');
+const bcrypt   = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
-const pool = require('./db/postgres');
+const fs       = require('fs');
+const path     = require('path');
+const pool     = require('./db/postgres');
 const { setSession, getSession, deleteSession } = require('./db/redis');
+const { optionalAuth, JWT_SECRET } = require('./middleware/auth');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173' }));
 app.use(express.json());
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Startup: run migrations then seed admin ───────────────────────────────────
+async function runMigrations() {
+  const migrationsDir = path.join(__dirname, '..', 'migrations');
+  const files = fs.readdirSync(migrationsDir).filter(f => f.endsWith('.sql')).sort();
+  for (const file of files) {
+    const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+    try { await pool.query(sql); console.log(`Migration OK: ${file}`); }
+    catch (err) { console.warn(`Migration warning (${file}):`, err.message); }
+  }
+}
 
+async function seedAdmin() {
+  const { rows } = await pool.query("SELECT id FROM users WHERE role='admin' LIMIT 1");
+  if (!rows.length) {
+    const hash = await bcrypt.hash(process.env.ADMIN_PASSWORD || 'Admin@123', 10);
+    await pool.query("INSERT INTO users (name,email,password,role) VALUES ($1,$2,$3,'admin')", [
+      'Admin',
+      process.env.ADMIN_EMAIL || 'admin@mathquiz.com',
+      hash,
+    ]);
+    console.log('Default admin created → admin@mathquiz.com / Admin@123');
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function formatQuestion(q, number, total) {
-  return {
-    id: q.id,
-    number,
-    total,
-    text: q.question_text,
-    options: { a: q.option_a, b: q.option_b, c: q.option_c, d: q.option_d },
-  };
+  return { id: q.id, number, total, text: q.question_text,
+           options: { a: q.option_a, b: q.option_b, c: q.option_c, d: q.option_d } };
 }
 
 function buildRecommendations(wrongCount, topicName, difficulty) {
-  if (wrongCount === 0) {
-    return [{ topic: '🏆 Perfect Score!', reason: `Every ${topicName} ${difficulty} question correct. Try a harder level next!` }];
-  }
-  if (wrongCount <= 3) {
-    return [{ topic: `📖 Review ${topicName} (${difficulty})`, reason: `You got ${wrongCount} question(s) wrong. Re-read each explanation, then retry.` }];
-  }
+  if (!wrongCount)     return [{ topic: '🏆 Perfect Score!', reason: `All ${topicName} ${difficulty} questions correct. Try a harder level!` }];
+  if (wrongCount <= 3) return [{ topic: `📖 Review ${topicName}`, reason: `${wrongCount} wrong. Re-read explanations then retry.` }];
   return [
-    { topic: `📖 More ${topicName} Practice`, reason: `You got ${wrongCount} questions wrong. Work through each explanation carefully.` },
-    { topic: '💡 Tip', reason: 'Write your working step-by-step before choosing an answer.' },
+    { topic: `📖 More ${topicName} Practice`, reason: `${wrongCount} wrong. Work through each explanation carefully.` },
+    { topic: '💡 Tip', reason: 'Write your working step-by-step before answering.' },
   ];
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
+app.use('/api/auth',    require('./routes/auth'));
+app.use('/api/admin',   require('./routes/admin'));
+app.use('/api/student', require('./routes/student'));
 
-// GET /api/topics
 app.get('/api/topics', async (_req, res) => {
   try {
-    const { rows } = await pool.query(
-      'SELECT id, name, description, icon, color FROM topics ORDER BY id'
-    );
-    const counts = await pool.query(
-      "SELECT topic_id, COUNT(*) FILTER (WHERE difficulty='easy') AS easy_count FROM questions GROUP BY topic_id"
-    );
-    const countMap = Object.fromEntries(counts.rows.map((r) => [r.topic_id, Number(r.easy_count)]));
-    res.json(rows.map((t) => ({ ...t, questionCount: 10 })));
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Database error' });
-  }
+    const { rows } = await pool.query('SELECT id,name,description,icon,color FROM topics ORDER BY id');
+    res.json(rows.map(t => ({ ...t, questionCount: 10 })));
+  } catch (err) { res.status(500).json({ error: 'Database error' }); }
 });
 
-// POST /api/quiz/start
-app.post('/api/quiz/start', async (req, res) => {
+app.post('/api/quiz/start', optionalAuth, async (req, res) => {
   const { topicId, difficulty = 'easy' } = req.body;
+  const userId = req.user?.userId || null;
   try {
     const { rows } = await pool.query(
-      'SELECT * FROM questions WHERE topic_id = $1 AND difficulty = $2 ORDER BY RANDOM() LIMIT 10',
+      'SELECT * FROM questions WHERE topic_id=$1 AND difficulty=$2 ORDER BY RANDOM() LIMIT 10',
       [topicId, difficulty]
     );
-    if (rows.length === 0) return res.status(400).json({ error: 'No questions found' });
+    if (!rows.length) return res.status(400).json({ error: 'No questions found' });
 
-    const topicRes = await pool.query('SELECT name FROM topics WHERE id = $1', [topicId]);
+    const topicRes  = await pool.query('SELECT name FROM topics WHERE id=$1', [topicId]);
     const topicName = topicRes.rows[0]?.name || 'Math';
-
-    // Persist session to Postgres
     const sessionId = uuidv4();
+
     await pool.query(
-      'INSERT INTO quiz_sessions (id, topic_id, difficulty, total_q) VALUES ($1, $2, $3, $4)',
-      [sessionId, topicId, difficulty, rows.length]
+      'INSERT INTO quiz_sessions (id,topic_id,difficulty,total_q,user_id) VALUES ($1,$2,$3,$4,$5)',
+      [sessionId, topicId, difficulty, rows.length, userId]
     );
-
-    // Store active quiz state in Redis
-    await setSession(sessionId, {
-      topicId: Number(topicId),
-      topicName,
-      difficulty,
-      questions: rows,
-      currentIndex: 0,
-    });
-
+    await setSession(sessionId, { topicId: Number(topicId), topicName, difficulty, questions: rows, currentIndex: 0 });
     res.json({ sessionId, question: formatQuestion(rows[0], 1, rows.length) });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to start quiz' });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: 'Failed to start quiz' }); }
 });
 
-// POST /api/quiz/:sessionId/answer
 app.post('/api/quiz/:sessionId/answer', async (req, res) => {
   const { sessionId } = req.params;
   const { chosenOption } = req.body;
-
   try {
     const session = await getSession(sessionId);
     if (!session) return res.status(404).json({ error: 'Session expired or not found' });
@@ -103,17 +99,10 @@ app.post('/api/quiz/:sessionId/answer', async (req, res) => {
     const q = session.questions[session.currentIndex];
     const isCorrect = chosenOption === q.correct_option;
 
-    // Persist this answer to Postgres
     await pool.query(
-      `INSERT INTO session_answers
-        (session_id, question_id, question_text, option_a, option_b, option_c, option_d,
-         chosen_option, correct_option, is_correct, explanation)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-      [
-        sessionId, q.id, q.question_text,
-        q.option_a, q.option_b, q.option_c, q.option_d,
-        chosenOption, q.correct_option, isCorrect, q.explanation,
-      ]
+      `INSERT INTO session_answers (session_id,question_id,question_text,option_a,option_b,option_c,option_d,
+       chosen_option,correct_option,is_correct,explanation) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [sessionId,q.id,q.question_text,q.option_a,q.option_b,q.option_c,q.option_d,chosenOption,q.correct_option,isCorrect,q.explanation]
     );
 
     session.currentIndex++;
@@ -122,116 +111,69 @@ app.post('/api/quiz/:sessionId/answer', async (req, res) => {
     if (hasNext) {
       await setSession(sessionId, session);
     } else {
-      // Finalise session in Postgres
-      const answersRes = await pool.query(
-        'SELECT COUNT(*) FILTER (WHERE is_correct) AS correct FROM session_answers WHERE session_id = $1',
-        [sessionId]
+      const ans = await pool.query(
+        "SELECT COUNT(*) FILTER (WHERE is_correct) AS correct FROM session_answers WHERE session_id=$1", [sessionId]
       );
-      const correct = Number(answersRes.rows[0].correct);
+      const correct  = Number(ans.rows[0].correct);
       const scorePct = Math.round((correct / session.questions.length) * 100);
       await pool.query(
-        'UPDATE quiz_sessions SET completed_at = NOW(), correct_q = $1, score_pct = $2 WHERE id = $3',
+        'UPDATE quiz_sessions SET completed_at=NOW(),correct_q=$1,score_pct=$2 WHERE id=$3',
         [correct, scorePct, sessionId]
       );
       await deleteSession(sessionId);
     }
 
-    const response = {
-      isCorrect,
-      correctOption: q.correct_option,
-      explanation: q.explanation,
-      hasNext,
-    };
-    if (hasNext) {
-      response.nextQuestion = formatQuestion(
-        session.questions[session.currentIndex],
-        session.currentIndex + 1,
-        session.questions.length
-      );
-    }
+    const response = { isCorrect, correctOption: q.correct_option, explanation: q.explanation, hasNext };
+    if (hasNext) response.nextQuestion = formatQuestion(session.questions[session.currentIndex], session.currentIndex + 1, session.questions.length);
     res.json(response);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to submit answer' });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: 'Failed to submit answer' }); }
 });
 
-// GET /api/quiz/:sessionId/summary
 app.get('/api/quiz/:sessionId/summary', async (req, res) => {
-  const { sessionId } = req.params;
   try {
-    const sessionRes = await pool.query(
-      `SELECT qs.*, t.name AS topic_name
-       FROM quiz_sessions qs JOIN topics t ON t.id = qs.topic_id
-       WHERE qs.id = $1`,
-      [sessionId]
+    const sRes = await pool.query(
+      'SELECT qs.*,t.name AS topic_name FROM quiz_sessions qs JOIN topics t ON t.id=qs.topic_id WHERE qs.id=$1',
+      [req.params.sessionId]
     );
-    if (!sessionRes.rows.length) return res.status(404).json({ error: 'Session not found' });
-    const s = sessionRes.rows[0];
+    if (!sRes.rows.length) return res.status(404).json({ error: 'Session not found' });
+    const s = sRes.rows[0];
 
-    const answersRes = await pool.query(
-      'SELECT * FROM session_answers WHERE session_id = $1 ORDER BY id',
-      [sessionId]
-    );
-
-    const answers = answersRes.rows.map((a) => ({
+    const aRes = await pool.query('SELECT * FROM session_answers WHERE session_id=$1 ORDER BY id', [req.params.sessionId]);
+    const answers = aRes.rows.map(a => ({
       questionText: a.question_text,
       options: { a: a.option_a, b: a.option_b, c: a.option_c, d: a.option_d },
-      chosen: a.chosen_option,
-      correct: a.correct_option,
-      isCorrect: a.is_correct,
-      explanation: a.explanation,
-      chosenText: a[`option_${a.chosen_option}`],
-      correctText: a[`option_${a.correct_option}`],
+      chosen: a.chosen_option, correct: a.correct_option,
+      isCorrect: a.is_correct, explanation: a.explanation,
+      chosenText: a[`option_${a.chosen_option}`], correctText: a[`option_${a.correct_option}`],
     }));
 
-    const wrongCount = answers.filter((a) => !a.isCorrect).length;
-
+    const wrongCount = answers.filter(a => !a.isCorrect).length;
     res.json({
-      topicId: s.topic_id,
-      topicName: s.topic_name,
-      difficulty: s.difficulty,
-      score: s.correct_q,
-      scorePercent: Number(s.score_pct),
-      totalQuestions: s.total_q,
-      correctCount: s.correct_q,
-      wrongCount,
-      answers,
-      recommendations: buildRecommendations(wrongCount, s.topic_name, s.difficulty),
+      topicId: s.topic_id, topicName: s.topic_name, difficulty: s.difficulty,
+      score: s.correct_q, scorePercent: Number(s.score_pct),
+      totalQuestions: s.total_q, correctCount: s.correct_q, wrongCount,
+      answers, recommendations: buildRecommendations(wrongCount, s.topic_name, s.difficulty),
     });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to load summary' });
-  }
+  } catch (err) { res.status(500).json({ error: 'Failed to load summary' }); }
 });
 
-// GET /api/history
 app.get('/api/history', async (_req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT
-        qs.id,
-        qs.topic_id,
-        t.name        AS topic_name,
-        t.icon,
-        qs.difficulty,
-        qs.total_q,
-        qs.correct_q,
-        qs.score_pct,
-        qs.started_at,
-        qs.completed_at,
-        EXTRACT(EPOCH FROM (qs.completed_at - qs.started_at))::INT AS duration_sec
-      FROM quiz_sessions qs
-      JOIN topics t ON t.id = qs.topic_id
-      WHERE qs.completed_at IS NOT NULL
-      ORDER BY qs.completed_at DESC
-      LIMIT 50
+      SELECT qs.*,t.name AS topic_name,t.icon,
+             EXTRACT(EPOCH FROM (qs.completed_at-qs.started_at))::INT AS duration_sec
+      FROM quiz_sessions qs JOIN topics t ON t.id=qs.topic_id
+      WHERE qs.completed_at IS NOT NULL ORDER BY qs.completed_at DESC LIMIT 50
     `);
     res.json(rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to load history' });
-  }
+  } catch (err) { res.status(500).json({ error: 'Failed to load history' }); }
 });
 
-app.listen(PORT, () => console.log(`Quiz API running → http://localhost:${PORT}`));
+// ── Boot ──────────────────────────────────────────────────────────────────────
+async function boot() {
+  await runMigrations();
+  await seedAdmin();
+  app.listen(PORT, () => console.log(`Quiz API → http://localhost:${PORT}`));
+}
+
+boot().catch(err => { console.error('Boot failed:', err); process.exit(1); });
